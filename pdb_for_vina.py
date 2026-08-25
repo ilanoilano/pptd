@@ -15,6 +15,7 @@ Vina 受体准备模块
 
 import os
 import sys
+import random
 import subprocess
 import json
 from pathlib import Path

@@ -19,6 +19,7 @@ EGNN预测器 (egnn_predictor.py)
 """
 
 import sys
+import random
 import re
 import numpy as np
 import torch

@@ -3,6 +3,7 @@
 from pathlib import Path
 import sys
 sys.path.insert(0, "/mnt/d/code/AA")
+import random
 
 from pdb_for_vina import pdb_to_pdbqt_obabel as pdb_to_pdbqt
 

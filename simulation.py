@@ -12,6 +12,7 @@ MCTS Simulation模块 V2 (simulation.py)
 
 import sys
 import random
+import os
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Callable
