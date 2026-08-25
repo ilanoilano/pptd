@@ -24,6 +24,7 @@ EGNN训练模块 (EGNN_23.py)
 import os
 import sys
 import json
+import random
 import numpy as np
 import torch
 import torch.nn as nn

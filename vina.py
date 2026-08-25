@@ -252,10 +252,14 @@ def run_vina_with_progress(ligand_pdbqt: Path,
         if verbose:
             print("-" * 50)
         
-        if returncode != 0:
+        # 【修复】处理Vina返回码
+        # returncode = 0: 成功
+        # returncode = -2: 警告（如无法利用所有CPU），但对接可能成功
+        # returncode < 0: 其他错误
+        if returncode < 0 and returncode != -2:
             error_msg = "\n".join(stdout_lines[-10:]) if stdout_lines else "无错误输出"
             print(f"\n{'='*60}")
-            print(f"【Vina错误】Vina进程返回非零退出码")
+            print(f"【Vina错误】Vina进程返回错误码")
             print(f"{'='*60}")
             print(f"  返回码: {returncode}")
             print(f"  序列: {sequence}")
@@ -277,11 +281,18 @@ def run_vina_with_progress(ligand_pdbqt: Path,
             print(f"{'='*60}\n")
             raise RuntimeError(f"Vina返回错误码 {returncode}: {error_msg}")
         
-        # 解析结合能
+        # 处理警告（returncode = -2）
+        if returncode == -2:
+            print(f"\n【Vina警告】返回码-2（警告，但可能成功）")
+            print(f"  这通常表示：无法利用所有CPU（exhaustiveness < cpu）")
+            print(f"  将继续尝试解析输出...")
+        
+        # 解析结合能（支持Vina 1.1.2和1.2+格式）
         binding_energy = None
         stdout_text = '\n'.join(stdout_lines)
         
         for line in stdout_lines:
+            # Vina 1.2+ 格式: REMARK VINA RESULT: -8.5 0.000 0.000
             if 'REMARK VINA RESULT:' in line:
                 try:
                     parts = line.split()
@@ -289,6 +300,22 @@ def run_vina_with_progress(ligand_pdbqt: Path,
                     break
                 except (ValueError, IndexError):
                     continue
+            # Vina 1.1.2 格式:    1         -2.6      0.000      0.000
+            # 解析模式行（以数字开头，包含affinity列）
+            stripped = line.strip()
+            if stripped and stripped[0].isdigit() and 'affinity' not in line.lower():
+                parts = stripped.split()
+                if len(parts) >= 2:
+                    try:
+                        # 第一列是mode编号，第二列是affinity
+                        mode_num = int(parts[0])
+                        energy = float(parts[1])
+                        # 只取第一个模式（最佳结合能）
+                        if mode_num == 1:
+                            binding_energy = energy
+                            break
+                    except (ValueError, IndexError):
+                        continue
         
         if binding_energy is None:
             print(f"\n{'='*60}")
@@ -297,8 +324,8 @@ def run_vina_with_progress(ligand_pdbqt: Path,
             print(f"  序列: {sequence}")
             print(f"  配体: {ligand_pdbqt}")
             print(f"  受体: {receptor_pdbqt}")
-            print(f"\n  Vina输出内容（前500字符）:")
-            print(f"  {stdout_text[:500]}")
+            print(f"\n  Vina输出内容（前800字符）:")
+            print(f"  {stdout_text[:800]}")
             print(f"\n  可能原因:")
             print(f"    1. Vina输出格式异常（版本不兼容？）")
             print(f"    2. Vina未能成功对接（配体/受体问题）")
@@ -309,6 +336,29 @@ def run_vina_with_progress(ligand_pdbqt: Path,
             print(f"    3. 检查配体和受体文件是否有效")
             print(f"{'='*60}\n")
             raise RuntimeError("无法从Vina输出解析结合能，可能是Vina执行失败或输出格式异常")
+        
+        # 【关键修复】检查结合能是否为正值（表示对接失败）
+        if binding_energy > 0:
+            print(f"\n{'='*60}")
+            print(f"【Vina警告】对接产生正值结合能 ({binding_energy:.2f} kcal/mol)")
+            print(f"{'='*60}")
+            print(f"  序列: {sequence}")
+            print(f"  配体: {ligand_pdbqt}")
+            print(f"  受体: {receptor_pdbqt}")
+            print(f"\n  可能原因:")
+            print(f"    1. 分子构象生成失败（如'Can't kekulize mol'错误）")
+            print(f"    2. 对接盒子设置不正确（中心/大小）")
+            print(f"    3. 配体与受体有严重冲突")
+            print(f"    4. 分子结构不合理（如键长/键角异常）")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查ligand_generator.py的分子生成逻辑")
+            print(f"    2. 检查Vina配置文件的盒子参数")
+            print(f"    3. 使用OpenBabel验证分子: obabel {ligand_pdbqt} -O test.pdb")
+            print(f"    4. 手动检查生成的PDBQT文件")
+            print(f"{'='*60}\n")
+            # 返回失败结果，让上层决定是否继续
+            return VinaResult(binding_energy, output_pdbqt, False, 
+                            f"正值结合能 ({binding_energy:.2f})，对接失败", sequence)
         
         if verbose:
             seq_info = f"[{sequence}] " if sequence else ""
@@ -525,7 +575,9 @@ def batch_vina_dock_parallel(sequences: List[str],
     if n_workers is None:
         n_workers = config.PARALLEL_VINA_CONFIG.get("num_workers", multiprocessing.cpu_count())
     if n_cpu_per_worker is None:
-        n_cpu_per_worker = config.PARALLEL_VINA_CONFIG.get("cpu_per_worker", 1)
+        # 【关键修复】使用 VINA_CONFIG["cpu"] 而不是 PARALLEL_VINA_CONFIG["cpu_per_worker"]
+        # 确保与单分子对接的CPU设置一致
+        n_cpu_per_worker = config.VINA_CONFIG.get("cpu", 4)
     
     print("="*60)
     print(f"批量Vina对接（并行模式）")

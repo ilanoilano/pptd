@@ -42,6 +42,41 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config
 
 # =============================================================================
+# 日志配置
+# =============================================================================
+LOGS_DIR = config.BASE_DIR / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+def setup_logger(target_name: str):
+    """设置日志记录器"""
+    import logging
+    
+    logger = logging.getLogger(f"Phase2Engine_{target_name}")
+    logger.setLevel(logging.INFO)
+    
+    # 清除已有处理器
+    logger.handlers = []
+    
+    # 文件处理器
+    log_file = LOGS_DIR / f"{target_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    file_handler = logging.FileHandler(log_file, encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    
+    # 控制台处理器
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    
+    # 格式
+    formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
+    file_handler.setFormatter(formatter)
+    console_handler.setFormatter(formatter)
+    
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger, log_file
+
+# =============================================================================
 # 调试配置
 # =============================================================================
 DEBUG_MODE = os.environ.get('MCTS_DEBUG', '0') == '1'
@@ -127,19 +162,28 @@ class MCTSState:
 
 class Phase2Engine:
     """
-    阶段二主引擎 V2 - 支持三层决策
+    阶段二主引擎 V2 - 支持三层决策和训练恢复
     """
     
-    def __init__(self, target_name: str, checkpoint_dir: Optional[Path] = None):
+    def __init__(self, target_name: str, checkpoint_dir: Optional[Path] = None, resume: bool = True):
         """
         初始化引擎
         
         Args:
             target_name: 靶点名称
             checkpoint_dir: 检查点保存目录
+            resume: 是否尝试从检查点恢复训练
         """
         self.target_name = target_name
         self.target_dirs = config.get_target_dirs(target_name)
+        
+        # 设置日志
+        self.logger, self.log_file = setup_logger(target_name)
+        self.logger.info(f"="*60)
+        self.logger.info(f"Phase2Engine 初始化")
+        self.logger.info(f"靶点: {target_name}")
+        self.logger.info(f"日志文件: {self.log_file}")
+        self.logger.info(f"="*60)
         
         # 检查第一阶段是否完成
         if not (self.target_dirs["vina"] / "vina-receptor.pdbqt").exists():
@@ -152,9 +196,16 @@ class Phase2Engine:
             self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
+        # 恢复状态文件
+        self.resume_state_file = self.checkpoint_dir / "resume_state.json"
+        
         # 结果目录
         self.results_dir = config.RESULTS_DIR / target_name
         self.results_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 恢复标志
+        self.resume = resume
+        self.resumed_from_checkpoint = False
         
         # MCTS组件（V2）
         self.selector = PUCTSelector(c_puct=config.MCTS_CONFIG["c_puct"])
@@ -251,11 +302,12 @@ class Phase2Engine:
                 )
                 
                 # Vina对接
+                # 【修复】使用config中的CPU配置，而不是硬编码为1
                 result = run_vina_with_progress(
                     ligand_pdbqt=pdbqt_path,
                     receptor_pdbqt=vina_paths['receptor'],
                     vina_config=vina_paths['config'],
-                    n_cpu=1
+                    n_cpu=config.VINA_CONFIG.get("cpu", 4)
                 )
                 
                 if result.success:
@@ -758,25 +810,92 @@ class Phase2Engine:
         root = self._rebuild_tree_from_snapshot(snapshot)
         
         if root:
+            self.resumed_from_checkpoint = True
             print(f"  ✓ 加载检查点: {checkpoint_path} (迭代 {self.iteration}, {len(nodes)} 个节点)")
+            self.logger.info(f"从检查点恢复: 迭代 {self.iteration}, {len(nodes)} 个节点")
         
         return root
+    
+    def save_resume_state(self, state: dict):
+        """
+        保存恢复状态（用于中断后恢复）
+        
+        Args:
+            state: 包含训练状态的字典
+        """
+        state['timestamp'] = datetime.now().isoformat()
+        state['target_name'] = self.target_name
+        
+        with open(self.resume_state_file, 'w') as f:
+            json.dump(state, f, indent=2)
+        
+        self.logger.info(f"保存恢复状态: {self.resume_state_file}")
+    
+    def load_resume_state(self) -> Optional[dict]:
+        """
+        加载恢复状态
+        
+        Returns:
+            恢复状态字典，如果没有则返回None
+        """
+        if not self.resume_state_file.exists():
+            return None
+        
+        try:
+            with open(self.resume_state_file, 'r') as f:
+                state = json.load(f)
+            
+            self.logger.info(f"加载恢复状态: {self.resume_state_file}")
+            self.logger.info(f"  上次运行时间: {state.get('timestamp', 'unknown')}")
+            self.logger.info(f"  上次迭代: {state.get('iteration', 0)}")
+            return state
+        except Exception as e:
+            self.logger.error(f"加载恢复状态失败: {e}")
+            return None
     
     def run(self, 
             n_mcts_iterations: int = 1000,
             validation_interval: int = 5000,
-            max_iterations: int = 50000):
-        """运行阶段二主循环"""
+            max_iterations: int = 50000,
+            cold_start_n: int = 100):
+        """
+        运行阶段二主循环
+        
+        Args:
+            n_mcts_iterations: 每次MCTS迭代次数
+            validation_interval: 验证间隔
+            max_iterations: 最大迭代次数
+            cold_start_n: 冷启动序列数量
+        """
         print("="*60)
         print(f"阶段二：MCTS三层决策闭环搜索")
         print(f"靶点: {self.target_name}")
         print(f"配置交联剂: {config.CROSSLINKER}")
         print("="*60)
         
+        # 尝试加载恢复状态
+        resume_state = None
+        if self.resume:
+            resume_state = self.load_resume_state()
+            if resume_state:
+                print(f"\n检测到之前的训练状态，将从中断处恢复...")
+                print(f"  上次迭代: {resume_state.get('iteration', 0)}")
+                print(f"  上次时间: {resume_state.get('timestamp', 'unknown')}")
+        
         # 检查是否需要冷启动
         if not self.egnn_model_path.exists():
-            print("\n未检测到EGNN模型，执行冷启动...")
-            self.cold_start(n_sequences=100)
+            if resume_state and resume_state.get('cold_start_completed'):
+                print("\n检测到EGNN模型缺失，但冷启动已完成标记存在...")
+                print("  可能需要重新训练EGNN模型")
+            else:
+                print("\n未检测到EGNN模型，执行冷启动...")
+                self.cold_start(n_sequences=cold_start_n)
+                # 标记冷启动已完成
+                self.save_resume_state({
+                    'cold_start_completed': True,
+                    'iteration': 0,
+                    'phase': 'mcts_search'
+                })
         else:
             print("\n检测到已有EGNN模型，加载中...")
             self._load_egnn_model()
@@ -784,30 +903,105 @@ class Phase2Engine:
         # 创建或加载根节点（从检查点）
         root = self.load_checkpoint("latest.json")
         if root is None:
-            print("\n创建新的MCTS根节点...")
+            if resume_state and resume_state.get('iteration', 0) > 0:
+                print("\n警告: 有恢复状态但无法加载MCTS树检查点")
+                print("  将创建新的MCTS根节点，但保留已有数据")
+            else:
+                print("\n创建新的MCTS根节点...")
             root = create_root_node()
+        else:
+            print(f"\n从检查点恢复MCTS树（当前迭代: {self.iteration}）")
+        
+        # 恢复迭代计数（如果比检查点更大）
+        if resume_state and resume_state.get('iteration', 0) > self.iteration:
+            self.iteration = resume_state.get('iteration', 0)
+            print(f"  恢复迭代计数: {self.iteration}")
         
         print(f"\n开始MCTS搜索（最大迭代: {max_iterations}）...")
         
-        while self.iteration < max_iterations:
-            print(f"\n--- MCTS迭代 {self.iteration}-{self.iteration + n_mcts_iterations} ---")
-            root = self.mcts_iteration(
-                root, 
-                n_mcts_iterations,
-                max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5)
-            )
-            
-            # 保存检查点
-            self.save_checkpoint(root, "latest.json")
-            
-            if self.iteration % validation_interval < n_mcts_iterations:
-                print(f"\n--- 触发验证（迭代 {self.iteration}） ---")
-                candidates = self.extract_candidates(root, 100)
-                print(f"  提取 {len(candidates)} 个候选")
-                # TODO: Vina验证和重训
+        try:
+            while self.iteration < max_iterations:
+                print(f"\n--- MCTS迭代 {self.iteration}-{self.iteration + n_mcts_iterations} ---")
                 
-                # 保存当前检查点
-                self.save_checkpoint(root, f"checkpoint_iter{self.iteration}.json")
+                # 保存恢复状态（用于中断恢复）
+                self.save_resume_state({
+                    'cold_start_completed': True,
+                    'iteration': self.iteration,
+                    'phase': 'mcts_search',
+                    'best_states_count': len(self.best_states),
+                    'all_data_count': len(self.all_data)
+                })
+                
+                root = self.mcts_iteration(
+                    root, 
+                    n_mcts_iterations,
+                    max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5)
+                )
+                
+                # 保存检查点
+                self.save_checkpoint(root, "latest.json")
+                
+                if self.iteration % validation_interval < n_mcts_iterations:
+                    print(f"\n--- 触发验证（迭代 {self.iteration}） ---")
+                    candidates = self.extract_candidates(root, 100)
+                    print(f"  提取 {len(candidates)} 个候选")
+                    # TODO: Vina验证和重训
+                    
+                    # 保存当前检查点
+                    self.save_checkpoint(root, f"checkpoint_iter{self.iteration}.json")
+            
+            # 训练完成，标记状态
+            self.save_resume_state({
+                'cold_start_completed': True,
+                'iteration': self.iteration,
+                'phase': 'completed',
+                'best_states_count': len(self.best_states),
+                'all_data_count': len(self.all_data),
+                'completed': True
+            })
+            
+        except KeyboardInterrupt:
+            print("\n\n" + "="*60)
+            print("训练被用户中断")
+            print("="*60)
+            print(f"当前迭代: {self.iteration}")
+            print(f"已保存检查点: {self.checkpoint_dir}/latest.json")
+            print(f"恢复状态: {self.resume_state_file}")
+            print("\n下次运行将自动从中断处恢复")
+            print("="*60)
+            
+            # 保存最终状态
+            self.save_checkpoint(root, "interrupted.json")
+            self.save_resume_state({
+                'cold_start_completed': True,
+                'iteration': self.iteration,
+                'phase': 'interrupted',
+                'best_states_count': len(self.best_states),
+                'all_data_count': len(self.all_data),
+                'interrupted': True
+            })
+            
+            raise
+        
+        except Exception as e:
+            print("\n\n" + "="*60)
+            print("训练发生错误")
+            print("="*60)
+            print(f"错误: {e}")
+            print(f"当前迭代: {self.iteration}")
+            
+            # 保存错误状态
+            self.save_checkpoint(root, "error.json")
+            self.save_resume_state({
+                'cold_start_completed': True,
+                'iteration': self.iteration,
+                'phase': 'error',
+                'error': str(e),
+                'best_states_count': len(self.best_states),
+                'all_data_count': len(self.all_data)
+            })
+            
+            raise
         
         print("\n" + "="*60)
         print("阶段二完成！")
@@ -841,19 +1035,54 @@ def main():
                        help='验证间隔')
     parser.add_argument('--max-iter', type=int, default=50000,
                        help='最大迭代数')
+    parser.add_argument('--no-resume', action='store_true',
+                       help='禁用自动恢复（从头开始训练）')
+    parser.add_argument('--reset', action='store_true',
+                       help='重置所有检查点和恢复状态（重新开始）')
     
     args = parser.parse_args()
     
-    engine = Phase2Engine(target_name=args.target)
+    # 处理重置请求
+    if args.reset:
+        checkpoint_dir = config.BASE_DIR / "checkpoints" / args.target
+        resume_file = checkpoint_dir / "resume_state.json"
+        
+        print("="*60)
+        print("重置训练状态")
+        print("="*60)
+        
+        if resume_file.exists():
+            resume_file.unlink()
+            print(f"  删除: {resume_file}")
+        
+        # 删除检查点文件
+        if checkpoint_dir.exists():
+            for f in checkpoint_dir.glob("*.json"):
+                f.unlink()
+                print(f"  删除: {f}")
+        
+        print("  训练状态已重置")
+        print("="*60)
+    
+    # 创建引擎（自动恢复）
+    engine = Phase2Engine(
+        target_name=args.target,
+        resume=not args.no_resume
+    )
     
     if args.cold_start:
         engine.cold_start(n_sequences=args.n_sequences)
     
-    engine.run(
-        n_mcts_iterations=args.mcts_iter,
-        validation_interval=args.val_interval,
-        max_iterations=args.max_iter
-    )
+    try:
+        engine.run(
+            n_mcts_iterations=args.mcts_iter,
+            validation_interval=args.val_interval,
+            max_iterations=args.max_iter,
+            cold_start_n=args.n_sequences
+        )
+    except KeyboardInterrupt:
+        print("\n训练已中断，可以使用相同命令恢复")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
