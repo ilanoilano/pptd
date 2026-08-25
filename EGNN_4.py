@@ -26,6 +26,7 @@ EGNN评估模块 (EGNN_4.py)
 
 import os
 import sys
+import random
 import json
 import numpy as np
 import torch
