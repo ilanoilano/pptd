@@ -3,19 +3,6 @@
 """
 配体生成器 (ligand_generator.py)
 功能：序列 → 3D构象（含交联剂）→ PDBQT
-
-修复：
-1. 使用RDKit的Chem.EditableMol逐个构建氨基酸残基
-2. 添加真正的交联剂分子和共价键
-3. 使用OpenBabel生成PDBQT（计算Gasteiger电荷）
-
-输入：
-- sequence: 完整氨基酸序列
-- crosslinker: 交联剂类型（TBMB/TATA/TBAB/None/disulfide）
-- crosslinker_positions: Cys连接位置
-
-输出：
-- PDBQT文件路径
 """
 
 import os
@@ -31,156 +18,199 @@ sys.path.insert(0, str(Path(__file__).parent))
 import config
 
 
-# 氨基酸模板（使用RDKit可识别的SMILES）
-# 这些模板包含完整的氨基酸结构，包括主链和侧链
-AA_TEMPLATES: Dict[str, str] = {
-    'A': 'CC(C(=O)O)N',  # 丙氨酸 - 简化模板
-    'C': 'C(CS)C(=O)O',  # 半胱氨酸 - 含巯基
-    'D': 'CC(C(=O)O)C(=O)O',  # 天冬氨酸
-    'E': 'CCC(C(=O)O)C(=O)O',  # 谷氨酸
-    'F': 'CC(c1ccccc1)C(=O)O',  # 苯丙氨酸
-    'G': 'NCC(=O)O',  # 甘氨酸
-    'H': 'CC(c1c[nH]cn1)C(=O)O',  # 组氨酸
-    'I': 'CC(C)CC(=O)O',  # 异亮氨酸
-    'K': 'CCCCN',  # 赖氨酸
-    'L': 'CC(C)C(=O)O',  # 亮氨酸
-    'M': 'CCSC',  # 甲硫氨酸
-    'N': 'CC(=O)N',  # 天冬酰胺
-    'P': 'C1CC(NC1)C(=O)O',  # 脯氨酸
-    'Q': 'CCC(=O)N',  # 谷氨酰胺
-    'R': 'CCCNC(=N)N',  # 精氨酸
-    'S': 'CO',  # 丝氨酸
-    'T': 'CC(O)',  # 苏氨酸
-    'V': 'CC(C)',  # 缬氨酸
-    'W': 'CC(c1c[nH]c2ccccc12)',  # 色氨酸
-    'Y': 'CC(c1ccc(O)cc1)',  # 酪氨酸
+# 【修复】使用项目目录下的临时文件夹，避免硬编码 /tmp
+TEMP_DIR = config.BASE_DIR / "temp" / "ligand_generator"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# 氨基酸SMILES（N端游离，C端羧基）
+AA_SMILES = {
+    'A': '[N][C@@H](C)C(=O)O',
+    'C': '[N][C@@H](CS)C(=O)O',  # Cys有硫原子S
+    'D': '[N][C@@H](CC(=O)O)C(=O)O',
+    'E': '[N][C@@H](CCC(=O)O)C(=O)O',
+    'F': '[N][C@@H](Cc1ccccc1)C(=O)O',
+    'G': '[N]CC(=O)O',
+    'H': '[N][C@@H](Cc1c[nH]cn1)C(=O)O',
+    'I': '[N][C@@H](C(C)CC)C(=O)O',
+    'K': '[N][C@@H](CCCCN)C(=O)O',
+    'L': '[N][C@@H](CC(C)C)C(=O)O',
+    'M': '[N][C@@H](CCSC)C(=O)O',
+    'N': '[N][C@@H](CC(=O)N)C(=O)O',
+    'P': 'N1CCCC1C(=O)O',
+    'Q': '[N][C@@H](CCC(=O)N)C(=O)O',
+    'R': '[N][C@@H](CCCNC(=N)N)C(=O)O',
+    'S': '[N][C@@H](CO)C(=O)O',
+    'T': '[N][C@@H](C(C)O)C(=O)O',
+    'V': '[N][C@@H](C(C)C)C(=O)O',
+    'W': '[N][C@@H](Cc1c[nH]c2ccccc12)C(=O)O',
+    'Y': '[N][C@@H](Cc1ccc(O)cc1)C(=O)O',
 }
 
-# 交联剂SMILES（真实结构）
+# 交联剂SMILES
 CROSSLINKER_SMILES = {
-    "TBMB": "c1c(cc(cc1CBr)CBr)CBr",  # 1,3,5-三(溴甲基)苯
-    "TATA": "C(CS)(CS)CS",  # 三(2-丙烯酰基)硫醇胺 - 简化
-    "TBAB": "c1c(cc(cc1CBr)CBr)c(CBr)c1CBr",  # 1,2,4,5-四(溴甲基)苯 - 简化
+    "TBMB": "c1c(cc(cc1CBr)CBr)CBr",
+    "TATA": "C(CS)(CS)CS",
+    "TBAB": "c1c(cc(cc1CBr)CBr)c(CBr)c1CBr",
 }
 
 
-def get_cys_positions(sequence: str) -> List[int]:
-    """获取序列中所有Cys的位置"""
-    return [i for i, aa in enumerate(sequence) if aa == 'C']
+def find_carboxyl_carbon(mol):
+    """找到羧基碳（C端）"""
+    from rdkit import Chem
+    
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 6:  # 碳
+            o_double = None
+            o_single = None
+            
+            for neighbor in atom.GetNeighbors():
+                if neighbor.GetAtomicNum() == 8:  # 氧
+                    bond = mol.GetBondBetweenAtoms(atom.GetIdx(), neighbor.GetIdx())
+                    if bond.GetBondType() == Chem.BondType.DOUBLE:
+                        o_double = neighbor.GetIdx()
+                    elif bond.GetBondType() == Chem.BondType.SINGLE:
+                        o_single = neighbor.GetIdx()
+            
+            if o_double is not None and o_single is not None:
+                return atom.GetIdx(), o_single
+    
+    return None, None
+
+
+def find_amino_nitrogen(mol):
+    """找到氨基氮（N端）"""
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 7:  # 氮
+            neighbors = list(atom.GetNeighbors())
+            carbon_count = sum(1 for n in neighbors if n.GetAtomicNum() == 6)
+            
+            if carbon_count >= 1 and carbon_count <= 2:
+                return atom.GetIdx()
+    
+    return None
 
 
 def build_peptide_with_rdkit(sequence: str) -> 'Chem.Mol':
-    """
-    使用RDKit构建肽链
-    
-    修复：使用EditableMol逐个添加氨基酸，形成真正的肽键
-    
-    Args:
-        sequence: 氨基酸序列
-    
-    Returns:
-        RDKit分子对象
-    """
+    """使用RDKit构建肽链"""
     try:
         from rdkit import Chem
-        from rdkit.Chem import AllChem
     except ImportError:
-        raise RuntimeError("RDKit未安装。请运行: pip install rdkit")
+        raise RuntimeError("RDKit未安装")
     
     if not sequence:
         raise ValueError("序列为空")
     
-    # 创建可编辑分子
-    mol = Chem.RWMol()
+    try:
+        if len(sequence) == 1:
+            smiles = AA_SMILES.get(sequence[0], AA_SMILES['A'])
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                raise RuntimeError(f"无法解析氨基酸: {sequence[0]}")
+            return mol
+        
+        # 创建第一个氨基酸
+        first_aa = sequence[0]
+        first_smiles = AA_SMILES.get(first_aa, AA_SMILES['A'])
+        mol = Chem.MolFromSmiles(first_smiles)
+        if mol is None:
+            raise RuntimeError(f"无法解析第一个氨基酸: {first_aa}")
+        
+        # 逐个添加氨基酸
+        for i in range(1, len(sequence)):
+            aa = sequence[i]
+            aa_smiles = AA_SMILES.get(aa, AA_SMILES['A'])
+            
+            next_mol = Chem.MolFromSmiles(aa_smiles)
+            if next_mol is None:
+                print(f"【警告】无法解析氨基酸 {aa}，跳过")
+                continue
+            
+            n_prev = mol.GetNumAtoms()
+            
+            c_atom_idx, oh_atom_idx = find_carboxyl_carbon(mol)
+            n_atom_idx = find_amino_nitrogen(next_mol)
+            
+            if c_atom_idx is None or oh_atom_idx is None or n_atom_idx is None:
+                print(f"【警告】第{i}个氨基酸：找不到连接点，简单合并")
+                mol = Chem.CombineMols(mol, next_mol)
+                continue
+            
+            # 合并分子
+            combined = Chem.CombineMols(mol, next_mol)
+            editable = Chem.EditableMol(combined)
+            
+            # 删除羟基（OH）
+            editable.RemoveAtom(oh_atom_idx)
+            
+            # 调整氮原子索引
+            if n_atom_idx > oh_atom_idx:
+                n_atom_idx -= 1
+            
+            # 创建肽键（C-N）
+            editable.AddBond(c_atom_idx, n_atom_idx + n_prev - (1 if oh_atom_idx < n_prev else 0), 
+                           Chem.BondType.SINGLE)
+            
+            mol = editable.GetMol()
+        
+        # Sanitize
+        try:
+            Chem.SanitizeMol(mol)
+        except:
+            Chem.SanitizeMol(
+                mol,
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
+                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
+            )
+        
+        return mol
+        
+    except Exception as e:
+        raise RuntimeError(f"构建肽链失败: {e}")
+
+
+def find_cys_sulfur_atoms(mol, sequence):
+    """
+    找到所有Cys的硫原子索引
     
-    # 原子映射：记录每个氨基酸的原子在分子中的索引
-    aa_atom_indices: List[Dict[str, int]] = []
+    Args:
+        mol: 肽分子
+        sequence: 氨基酸序列
     
-    prev_carbonyl_c = None  # 前一个氨基酸的羰基碳
-    prev_carbonyl_o = None  # 前一个氨基酸的羰基氧
+    Returns:
+        List[硫原子索引]
+    """
+    from rdkit import Chem
     
-    for i, aa in enumerate(sequence):
-        if aa not in AA_TEMPLATES:
-            raise ValueError(f"未知的氨基酸: {aa}")
-        
-        # 获取氨基酸模板
-        template_smiles = AA_TEMPLATES[aa]
-        template_mol = Chem.MolFromSmiles(template_smiles)
-        
-        if template_mol is None:
-            raise RuntimeError(f"无法解析氨基酸模板: {aa} -> {template_smiles}")
-        
-        # 添加原子到分子
-        atom_mapping = {}  # 模板原子索引 -> 新分子原子索引
-        for atom in template_mol.GetAtoms():
-            new_atom = Chem.Atom(atom.GetAtomicNum())
-            new_idx = mol.AddAtom(new_atom)
-            atom_mapping[atom.GetIdx()] = new_idx
-        
-        # 添加键
-        for bond in template_mol.GetBonds():
-            begin_idx = atom_mapping[bond.GetBeginAtomIdx()]
-            end_idx = atom_mapping[bond.GetEndAtomIdx()]
-            bond_type = bond.GetBondType()
-            mol.AddBond(begin_idx, end_idx, bond_type)
-        
-        # 记录关键原子位置
-        # 简化处理：假设第一个碳是α碳，最后两个是羧基
-        atom_indices = list(atom_mapping.values())
-        n_atom = atom_indices[0]  # 氨基氮
-        c_alpha = atom_indices[1] if len(atom_indices) > 1 else atom_indices[0]  # α碳
-        
-        # 找到羰基碳（与氧双键连接的碳）
-        c_atom = None
-        o_atom = None
-        for idx in atom_indices:
-            atom = mol.GetAtomWithIdx(idx)
-            if atom.GetAtomicNum() == 6:  # 碳
-                for neighbor in atom.GetNeighbors():
-                    if neighbor.GetAtomicNum() == 8:  # 氧
-                        # 检查是否为双键
-                        bond = mol.GetBondBetweenAtoms(idx, neighbor.GetIdx())
-                        if bond and bond.GetBondType() == Chem.BondType.DOUBLE:
-                            c_atom = idx
-                            o_atom = neighbor.GetIdx()
-                            break
-        
-        aa_atom_indices.append({
-            'N': n_atom,
-            'CA': c_alpha,
-            'C': c_atom,
-            'O': o_atom,
-            'all': atom_indices
-        })
-        
-        # 形成肽键（除了第一个氨基酸）
-        if i > 0 and prev_carbonyl_c is not None and c_atom is not None:
-            # 删除前一个氨基酸的羧基羟基（简化：不删除，直接连接）
-            # 在N和C之间形成肽键
-            # 注意：这里简化处理，实际应该删除水分子
-            pass  # 肽键形成在构象生成后处理
-        
-        prev_carbonyl_c = c_atom
-        prev_carbonyl_o = o_atom
+    sulfur_indices = []
     
-    # 转换为Mol对象
-    final_mol = mol.GetMol()
+    # 遍历分子中的所有硫原子
+    for atom in mol.GetAtoms():
+        if atom.GetAtomicNum() == 16:  # S
+            # 确认这是Cys的硫（连接在CB上）
+            # Cys结构: N-CA-CB-S
+            for neighbor in atom.GetNeighbors():
+                if neighbor.GetAtomicNum() == 6:  # 碳（CB）
+                    sulfur_indices.append(atom.GetIdx())
+                    break
     
-    return final_mol
+    return sulfur_indices
 
 
 def add_crosslinker(mol: 'Chem.Mol', 
                     crosslinker_type: str, 
-                    cys_positions: List[int]) -> 'Chem.Mol':
+                    cys_positions: List[int],
+                    sequence: str) -> 'Chem.Mol':
     """
     添加交联剂到分子
     
-    修复：添加真正的交联剂分子，使用AddBond创建共价键
+    【修复】正确找到Cys的硫原子并创建C-S键
     
     Args:
         mol: 肽分子
-        crosslinker_type: 交联剂类型（TBMB/TATA/TBAB）
-        cys_positions: Cys位置列表（原子索引）
+        crosslinker_type: 交联剂类型
+        cys_positions: Cys在序列中的位置列表（0-based）
+        sequence: 氨基酸序列（用于找到正确的Cys）
     
     Returns:
         含交联剂的分子
@@ -196,148 +226,223 @@ def add_crosslinker(mol: 'Chem.Mol',
     xlinker_mol = Chem.MolFromSmiles(xlinker_smiles)
     
     if xlinker_mol is None:
-        print(f"【警告】无法解析交联剂SMILES: {xlinker_smiles}")
+        xlinker_mol = Chem.MolFromSmiles(xlinker_smiles, sanitize=False)
+        if xlinker_mol is None:
+            print(f"【警告】无法解析交联剂SMILES: {xlinker_smiles}")
+            return mol
+        
+        try:
+            Chem.SanitizeMol(xlinker_mol)
+        except:
+            Chem.SanitizeMol(
+                xlinker_mol,
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
+                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
+            )
+    
+    # 【修复】找到所有Cys的硫原子
+    cys_sulfur_indices = find_cys_sulfur_atoms(mol, sequence)
+    
+    if not cys_sulfur_indices:
+        print(f"【警告】找不到Cys的硫原子")
         return mol
+    
+    print(f"【调试】找到 {len(cys_sulfur_indices)} 个Cys硫原子: {cys_sulfur_indices}")
+    
+    # 根据cys_positions选择要连接的硫原子
+    # cys_positions是序列位置，我们需要找到对应位置的Cys的硫原子
+    selected_sulfur_indices = []
+    for pos in cys_positions:
+        if pos < len(sequence) and sequence[pos] == 'C':
+            # 找到第pos个Cys对应的硫原子
+            cys_count = 0
+            for i, aa in enumerate(sequence):
+                if aa == 'C':
+                    if i == pos and cys_count < len(cys_sulfur_indices):
+                        selected_sulfur_indices.append(cys_sulfur_indices[cys_count])
+                        break
+                    cys_count += 1
+    
+    if not selected_sulfur_indices:
+        print(f"【警告】无法找到指定位置的Cys硫原子")
+        return mol
+    
+    print(f"【调试】选择的硫原子: {selected_sulfur_indices}")
     
     # 合并分子
     combo = Chem.CombineMols(mol, xlinker_mol)
     editable = Chem.EditableMol(combo)
     
-    # 找到交联剂中的溴原子（用于连接）
-    # 简化处理：假设交联剂中的Br是连接点
+    # 找到交联剂中的溴原子
     xlinker_start_idx = mol.GetNumAtoms()
     br_indices = []
     for i, atom in enumerate(xlinker_mol.GetAtoms()):
         if atom.GetAtomicNum() == 35:  # Br
             br_indices.append(xlinker_start_idx + i)
     
-    # 创建C-S键（Cys的S与交联剂的C）
-    # 注意：这里简化处理，实际应该删除Br并创建C-S键
-    for i, cys_idx in enumerate(cys_positions[:len(br_indices)]):
-        # 找到Cys的硫原子
-        cys_atom = combo.GetAtomWithIdx(cys_idx)
-        s_idx = None
-        for neighbor in cys_atom.GetNeighbors():
-            if neighbor.GetAtomicNum() == 16:  # S
-                s_idx = neighbor.GetIdx()
+    print(f"【调试】交联剂溴原子: {br_indices}")
+    
+    # 创建C-S键（Cys的S与交联剂的C，通过删除Br）
+    bonds_created = 0
+    for i, s_idx in enumerate(selected_sulfur_indices[:len(br_indices)]):
+        if i >= len(br_indices):
+            break
+        
+        br_idx = br_indices[i]
+        br_atom = combo.GetAtomWithIdx(br_idx)
+        
+        # 找到与Br相连的C（这是要与S连接的C）
+        c_idx = None
+        for neighbor in br_atom.GetNeighbors():
+            if neighbor.GetAtomicNum() == 6:  # C
+                c_idx = neighbor.GetIdx()
                 break
         
-        if s_idx is not None and i < len(br_indices):
-            br_idx = br_indices[i]
-            # 创建S-C键（连接到交联剂的碳）
-            # 找到与Br相连的碳
-            br_atom = combo.GetAtomWithIdx(br_idx)
-            for neighbor in br_atom.GetNeighbors():
-                if neighbor.GetAtomicNum() == 6:  # C
-                    c_idx = neighbor.GetIdx()
-                    # 添加S-C键
-                    editable.AddBond(s_idx, c_idx, Chem.BondType.SINGLE)
-                    break
+        if c_idx is not None:
+            # 删除Br原子
+            editable.RemoveAtom(br_idx)
+            
+            # 调整硫原子索引（如果Br在S之前）
+            adjusted_s_idx = s_idx
+            if br_idx < s_idx:
+                adjusted_s_idx -= 1
+            
+            # 调整C原子索引
+            adjusted_c_idx = c_idx
+            if br_idx < c_idx:
+                adjusted_c_idx -= 1
+            
+            # 创建C-S键
+            editable.AddBond(adjusted_s_idx, adjusted_c_idx, Chem.BondType.SINGLE)
+            bonds_created += 1
+            
+            print(f"【调试】创建键: S({adjusted_s_idx}) - C({adjusted_c_idx})")
+            
+            # 更新后续Br的索引（因为删除了一个原子）
+            for j in range(i + 1, len(br_indices)):
+                if br_indices[j] > br_idx:
+                    br_indices[j] -= 1
     
-    return editable.GetMol()
+    print(f"【调试】创建了 {bonds_created} 个C-S键")
+    
+    result_mol = editable.GetMol()
+    
+    # Sanitize
+    try:
+        Chem.SanitizeMol(result_mol)
+    except:
+        Chem.SanitizeMol(
+            result_mol,
+            sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
+                       Chem.SanitizeFlags.SANITIZE_KEKULIZE
+        )
+    
+    return result_mol
 
 
 def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42) -> 'Chem.Mol':
-    """
-    生成3D构象
-    
-    Args:
-        mol: 分子
-        random_seed: 随机种子
-    
-    Returns:
-        含3D构象的分子
-    """
+    """生成3D构象"""
     from rdkit import Chem
     from rdkit.Chem import AllChem
     
+    try:
+        Chem.SanitizeMol(mol)
+    except:
+        try:
+            Chem.SanitizeMol(
+                mol,
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
+                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
+            )
+        except:
+            pass
+    
     mol = Chem.AddHs(mol)
     
-    # 尝试生成构象
     success = False
     
-    # 方法1: ETKDGv3
     try:
         from rdkit.Chem import rdDistGeom
         params = rdDistGeom.ETKDGv3()
         params.randomSeed = random_seed
+        params.enforceChirality = False
         result = rdDistGeom.EmbedMolecule(mol, params)
         if result == 0:
             success = True
     except Exception as e:
         print(f"【警告】ETKDGv3失败: {e}")
     
-    # 方法2: 标准EmbedMolecule
     if not success:
-        result = AllChem.EmbedMolecule(mol, randomSeed=random_seed, maxAttempts=100)
-        if result == 0:
-            success = True
+        try:
+            result = AllChem.EmbedMolecule(mol, randomSeed=random_seed, maxAttempts=100)
+            if result == 0:
+                success = True
+        except Exception as e:
+            print(f"【警告】标准EmbedMolecule失败: {e}")
     
-    # 方法3: 随机坐标
     if not success:
-        result = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100, randomSeed=random_seed)
-        if result == 0:
-            success = True
+        try:
+            result = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100, randomSeed=random_seed)
+            if result == 0:
+                success = True
+        except Exception as e:
+            print(f"【警告】随机坐标EmbedMolecule失败: {e}")
     
     if not success:
         raise RuntimeError("所有构象生成方法都失败")
     
-    # 优化构象
-    AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    try:
+        AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+    except:
+        try:
+            AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+        except:
+            print("【警告】构象优化失败，使用未优化的构象")
     
     return mol
 
 
 def mol_to_pdbqt(mol: 'Chem.Mol', output_path: Path) -> Path:
-    """
-    将分子转换为PDBQT（使用OpenBabel）
-    
-    修复：使用OpenBabel计算Gasteiger电荷，不手写PDBQT
-    
-    Args:
-        mol: RDKit分子
-        output_path: 输出PDBQT路径
-    
-    Returns:
-        PDBQT文件路径
-    """
+    """将分子转换为PDBQT"""
     from rdkit import Chem
     
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # 保存为临时PDB
     temp_pdb = output_path.with_suffix('.temp.pdb')
     Chem.MolToPDBFile(mol, str(temp_pdb))
     
-    # 使用OpenBabel转换为PDBQT
     obabel_path = config.TOOLS.get("obabel", "obabel")
     
     cmd = [
         obabel_path,
         str(temp_pdb),
         "-opdbqt",
-        "-p",  # 计算Gasteiger电荷
+        "-p",
+        "-xl",
         "-O", str(output_path)
     ]
     
     try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         
         if result.returncode != 0:
             raise RuntimeError(f"OpenBabel转换失败: {result.stderr}")
         
-        # 验证输出
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError("PDBQT文件生成失败")
         
+        with open(output_path, 'r') as f:
+            content = f.read()
+        
+        root_count = content.count('\nROOT\n')
+        if root_count == 0:
+            print(f"【警告】配体PDBQT缺少ROOT标签")
+        elif root_count > 1:
+            print(f"【错误】配体PDBQT包含多个ROOT标签（{root_count}个）")
+            raise RuntimeError(f"配体PDBQT格式错误：包含{root_count}个ROOT标签")
+        
     finally:
-        # 清理临时文件
         if temp_pdb.exists():
             temp_pdb.unlink()
     
@@ -349,30 +454,17 @@ def generate_ligand(sequence: str,
                     crosslinker_positions: Optional[List[int]] = None,
                     output_dir: Optional[Path] = None,
                     random_seed: int = 42) -> Path:
-    """
-    主函数：序列 → PDBQT
-    
-    Args:
-        sequence: 完整氨基酸序列
-        crosslinker: 交联剂类型（TBMB/TATA/TBAB/None/disulfide）
-        crosslinker_positions: Cys连接位置（在序列中的索引）
-        output_dir: 输出目录
-        random_seed: 随机种子
-    
-    Returns:
-        PDBQT文件路径
-    """
+    """主函数：序列 → PDBQT"""
     import hashlib
     from rdkit import Chem
     
     if output_dir is None:
-        output_dir = Path(tempfile.gettempdir())
+        output_dir = TEMP_DIR
     else:
         output_dir = Path(output_dir)
     
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # 生成文件名
     seq_hash = hashlib.md5(f"{sequence}_{crosslinker}".encode()).hexdigest()[:8]
     output_pdbqt = output_dir / f"peptide_{seq_hash}.pdbqt"
     
@@ -381,19 +473,24 @@ def generate_ligand(sequence: str,
     # 1. 构建肽链
     mol = build_peptide_with_rdkit(sequence)
     
-    # 2. 添加交联剂（如果指定）
+    # 验证肽链
+    smiles_check = Chem.MolToSmiles(mol)
+    if '.' in smiles_check:
+        print(f"【错误】肽链构建失败，存在未连接片段: {smiles_check}")
+        raise RuntimeError("肽链构建失败")
+    
+    # 2. 添加交联剂
     if crosslinker and crosslinker in CROSSLINKER_SMILES:
         print(f"【ligand_generator】添加交联剂: {crosslinker}")
         
-        # 获取Cys位置（原子索引）
-        cys_indices = []
         if crosslinker_positions:
-            # 将序列位置转换为原子索引（简化：假设每个氨基酸3个原子）
-            for pos in crosslinker_positions[:3]:  # TBMB/TATA需要3个
-                cys_indices.append(pos * 3)
-        
-        if cys_indices:
-            mol = add_crosslinker(mol, crosslinker, cys_indices)
+            mol = add_crosslinker(mol, crosslinker, crosslinker_positions, sequence)
+            
+            # 验证交联后的分子
+            smiles_check = Chem.MolToSmiles(mol)
+            if '.' in smiles_check:
+                print(f"【错误】交联剂添加失败，存在未连接片段: {smiles_check}")
+                raise RuntimeError("交联剂添加失败")
     
     # 3. 生成3D构象
     print(f"【ligand_generator】生成3D构象...")

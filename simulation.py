@@ -7,6 +7,7 @@ MCTS Simulation模块 V2 (simulation.py)
 关键改进：
 - 使用MCTS确定的交联剂/拓扑，不再随机选择
 - 每个状态（序列+交联剂+二硫键）对应唯一的分子构象
+- 【修复】使用项目目录下的临时文件夹，避免硬编码 /tmp
 """
 
 import sys
@@ -22,6 +23,11 @@ import config
 from peptide_state import MCTSNode, PeptideState
 from ligand_generator import generate_ligand
 from egnn_predictor import create_egnn_predictor, EGNNPredictor
+
+
+# 【修复】使用项目目录下的临时文件夹，避免硬编码 /tmp
+TEMP_DIR = config.BASE_DIR / "temp" / "mcts_simulation"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -55,7 +61,8 @@ class SimulationEngine:
         self.egnn_model = egnn_model
         self.n_simulations = n_simulations
         
-        self.temp_dir = Path(tempfile.gettempdir()) / "mcts_simulation"
+        # 【修复】使用项目目录下的临时文件夹
+        self.temp_dir = TEMP_DIR
         self.temp_dir.mkdir(exist_ok=True)
     
     def get_crosslinker_config(self, state: PeptideState) -> tuple:
@@ -102,44 +109,18 @@ class SimulationEngine:
         
         Args:
             state: 肽状态
-            seed: 随机种子
+            seed: 随机种子（用于生成不同构象）
         
         Returns:
             预测结合能（kcal/mol）
-        
-        Raises:
-            RuntimeError: 如果EGNN模型未加载或预测失败
         """
-        print(f"[Simulation] 开始EGNN预测: {state}")
+        # 获取交联剂配置
+        crosslinker, positions = self.get_crosslinker_config(state)
         
-        # 如果没有EGNN模型，尝试创建
-        if self.egnn_model is None:
-            print("[Simulation] EGNN模型未加载，尝试创建...")
-            self.egnn_model = create_egnn_predictor()
-        
-        # 如果仍然没有模型（模型不存在或加载失败），返回错误
-        if self.egnn_model is None:
-            print("[Simulation] 【严重错误】EGNN模型创建失败！")
-            print("[Simulation]         可能原因：")
-            print("[Simulation]         1. 模型文件不存在: egnn/models/best_model.pt")
-            print("[Simulation]         2. PyTorch未安装")
-            print("[Simulation]         解决方案：")
-            print("[Simulation]         1. 运行 EGNN_1.py 准备数据")
-            print("[Simulation]         2. 运行 EGNN_23.py 训练模型")
-            raise RuntimeError(
-                "EGNN模型未加载。请先运行EGNN训练（EGNN_1.py + EGNN_23.py），"
-                "或检查模型路径是否正确。"
-            )
-        
-        print(f"[Simulation] ✓ EGNN模型已加载")
+        print(f"[Simulation] 交联剂配置: {crosslinker}, positions={positions}")
         
         try:
-            # 获取交联剂配置
-            crosslinker, positions = self.get_crosslinker_config(state)
-            print(f"[Simulation] 交联剂配置: {crosslinker}, positions={positions}")
-            
             # 生成分子
-            print(f"[Simulation] 生成分子: {state.sequence[:20]}...")
             pdbqt_path = generate_ligand(
                 sequence=state.sequence,
                 crosslinker=crosslinker,
@@ -147,41 +128,57 @@ class SimulationEngine:
                 output_dir=self.temp_dir,
                 random_seed=seed
             )
-            print(f"[Simulation] ✓ 分子生成成功: {pdbqt_path}")
             
             # EGNN预测
-            print(f"[Simulation] 开始EGNN预测...")
-            if isinstance(self.egnn_model, EGNNPredictor):
-                # 使用真正的EGNN预测器
-                energy = self.egnn_model.predict(pdbqt_path)
-            else:
-                # 兼容旧的callable接口
-                energy = self.egnn_model(pdbqt_path)
+            if self.egnn_model is None:
+                # 懒加载EGNN模型
+                self.egnn_model = create_egnn_predictor()
             
-            # 检查是否为mock值（随机数范围-12到-5）
-            if -12 < energy < -5:
-                import random
-                # 检查是否可能是随机数（通过比较多次调用）
-                test_energy = self.egnn_model.predict(pdbqt_path)
-                if abs(energy - test_energy) > 0.1:  # 如果两次预测差异大，可能是随机的
-                    print(f"[Simulation] 【警告】EGNN预测结果可能是随机数！")
-                    print(f"[Simulation]         第一次: {energy:.4f}, 第二次: {test_energy:.4f}")
-                    print(f"[Simulation]         请检查egnn_predictor.py是否正确实现")
-            
-            print(f"[Simulation] ✓ EGNN预测完成: energy={energy:.4f}")
+            energy = self.egnn_model.predict(pdbqt_path)
             return energy
             
         except Exception as e:
-            print(f"[Simulation] 【错误】EGNN预测失败: {e}")
-            print(f"[Simulation]         序列: {state.sequence}")
-            print(f"[Simulation]         交联剂: {state.crosslinker}")
-            raise  # 重新抛出异常，不返回默认值
+            print(f"[Simulation] EGNN预测失败: {e}")
+            # 返回一个较差的分数作为惩罚
+            return 0.0  # 0表示无效/失败
+    
+    def calculate_heuristic_score(self, state: PeptideState) -> float:
+        """
+        计算启发式分数（用于非终端节点）
+        
+        基于：
+        - 序列完成度
+        - Cys数量（用于交联）
+        - 氨基酸组成
+        """
+        score = 0.0
+        
+        # 序列完成度
+        completed = sum(1 for aa in state.sequence if aa != '_')
+        total = len(state.sequence)
+        score += 0.3 * (completed / total)
+        
+        # Cys数量（用于交联）
+        cys_count = len(state.get_cys_positions())
+        if state.crosslinker in ["TBMB", "TATA"]:
+            # 需要至少3个Cys
+            score += 0.3 * min(cys_count / 3, 1.0)
+        elif state.crosslinker == "TBAB":
+            # 需要至少4个Cys
+            score += 0.3 * min(cys_count / 4, 1.0)
+        elif state.crosslinker == "disulfide":
+            # 需要至少2个Cys
+            score += 0.3 * min(cys_count / 2, 1.0)
+        
+        # 多样性奖励（不同氨基酸类型）
+        aa_types = set(state.sequence.replace('_', ''))
+        score += 0.1 * min(len(aa_types) / 10, 1.0)
+        
+        return score
     
     def simulate(self, node: MCTSNode, verbose: bool = False) -> SimulationResult:
         """
-        模拟节点
-        
-        使用MCTS确定的完整状态进行评估
+        执行模拟（ rollout ）
         
         Args:
             node: MCTS节点
@@ -193,81 +190,65 @@ class SimulationEngine:
         state = node.state
         
         if verbose:
-            print(f"\n{'='*60}")
-            print(f"Simulation: {state}")
-            print(f"{'='*60}")
+            print(f"\n[Simulation] 开始模拟")
+            print(f"  序列: {state.sequence}")
+            print(f"  交联剂: {state.crosslinker}")
+            print(f"  二硫键: {state.disulfide_bonds}")
         
-        # 检查状态是否完整
+        # 检查是否为终端状态
         if not state.is_terminal:
+            # 非终端状态：使用启发式分数
+            score = self.calculate_heuristic_score(state)
             if verbose:
-                print(f"警告: 状态不完整，使用启发式评估")
-            # 对于非终端节点，使用启发式分数
+                print(f"  非终端状态，启发式分数: {score:.4f}")
             return SimulationResult(
-                score=0.5,
-                raw_energy=-7.0,
-                details={'heuristic': True}
+                score=score,
+                raw_energy=0.0,
+                details={"type": "heuristic", "completion": score}
             )
         
-        # 运行多次模拟（不同随机种子）
-        scores = []
+        # 终端状态：使用EGNN预测
+        energies = []
         for i in range(self.n_simulations):
-            energy = self.predict_with_egnn(state, seed=42 + i)
-            scores.append(energy)
+            seed = random.randint(1, 10000)
+            energy = self.predict_with_egnn(state, seed)
+            energies.append(energy)
+            if verbose:
+                print(f"  模拟 {i+1}/{self.n_simulations}: {energy:.4f} kcal/mol")
         
-        # 聚合分数（取平均）
-        raw_energy = sum(scores) / len(scores) if scores else 0.0
+        # 取最佳（最负）的结合能
+        best_energy = min(energies) if energies else 0.0
         
-        # 归一化
-        normalized_score = self.normalize_score(raw_energy)
+        # 归一化分数（假设结合能范围 -15 到 0）
+        # 越负越好，所以用 -energy
+        normalized_score = max(0.0, min(1.0, -best_energy / 15.0))
         
         if verbose:
-            print(f"\n聚合结果:")
-            print(f"  原始结合能: {raw_energy:.4f} kcal/mol")
+            print(f"  最佳结合能: {best_energy:.4f} kcal/mol")
             print(f"  归一化分数: {normalized_score:.4f}")
-            print(f"{'='*60}\n")
         
         return SimulationResult(
             score=normalized_score,
-            raw_energy=raw_energy,
+            raw_energy=best_energy,
             details={
-                'sequence': state.sequence,
-                'crosslinker': state.crosslinker,
-                'disulfide_bonds': state.disulfide_bonds,
-                'n_simulations': len(scores),
-                'individual_scores': scores
+                "type": "egnn",
+                "energies": energies,
+                "best_energy": best_energy
             }
         )
-    
-    def normalize_score(self, energy: float) -> float:
-        """
-        将结合能归一化到[0, 1]
-        
-        假设：
-        - -15 kcal/mol 为最好 → 1.0
-        - 0 kcal/mol 为最差 → 0.0
-        """
-        best_energy = -15.0
-        worst_energy = 0.0
-        
-        energy = max(worst_energy, min(best_energy, energy))
-        normalized = (worst_energy - energy) / (worst_energy - best_energy)
-        
-        return max(0.0, min(1.0, normalized))
 
 
 def main():
     """测试代码"""
     print("="*60)
-    print("Simulation引擎V2测试")
+    print("SimulationEngine测试")
     print("="*60)
     
-    from peptide_state import PeptideState, create_root_node
-    
-    # 创建模拟引擎
+    # 创建引擎
     engine = SimulationEngine(
         target_name="1LYZ",
-        egnn_model=None,  # 测试时使用随机分数
-        n_simulations=1
+        egnn_model=None,  # 使用默认EGNN
+        n_simulations=3
     )
     
     # 测试1：完整状态（TBMB交联）

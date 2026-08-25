@@ -203,13 +203,12 @@ class Phase2Engine:
         states = []
         for _ in range(n_sequences):
             seq = generate_full_sequence()
-            # 随机选择交联剂
-            xlinker_options = ["TBMB", "TATA", "disulfide", None]
-            xlinker = random.choice(xlinker_options)
+            # 【修复】使用 config.CROSSLINKER 而不是随机选择
+            xlinker = config.CROSSLINKER
             
             state = PeptideState(sequence=seq, crosslinker=xlinker)
             
-            # 如果是disulfide，随机选择一对
+            # 【修复】只有使用 disulfide 时才需要选择二硫键配对
             if xlinker == "disulfide":
                 bonds = state.get_possible_disulfide_bonds()
                 if bonds:
@@ -219,6 +218,7 @@ class Phase2Engine:
             states.append(state)
         
         print(f"  生成 {len(states)} 个状态")
+        print(f"  使用交联剂: {config.CROSSLINKER}")
         
         # 2. Vina对接
         print(f"\n[2/5] Vina对接（获取真实分数）...")
@@ -240,6 +240,7 @@ class Phase2Engine:
                     positions = list(state.disulfide_bonds[0]) if state.disulfide_bonds else None
                 else:
                     xlinker = state.crosslinker
+                    # 【修复】使用 config.CROSSLINKER_POSITIONS
                     positions = config.CROSSLINKER_POSITIONS if xlinker else None
                 
                 # 生成分子
@@ -393,24 +394,18 @@ class Phase2Engine:
         if self.egnn_model is None:
             debug_print("EGNN模型未加载，尝试加载...", "INFO")
             from egnn_predictor import create_egnn_predictor
-            self.egnn_model = create_egnn_predictor()
-            
-            if self.egnn_model is None:
-                debug_print("【严重错误】EGNN模型加载失败！", "CRITICAL")
-                debug_print("        可能原因：", "CRITICAL")
-                debug_print("        1. 模型文件不存在: egnn/models/best_model.pt", "CRITICAL")
-                debug_print("        2. 模型文件损坏", "CRITICAL")
-                debug_print("        3. PyTorch版本不兼容", "CRITICAL")
+            try:
+                self.egnn_model = create_egnn_predictor()
+                debug_print("✓ EGNN模型加载成功", "INFO")
+            except (FileNotFoundError, RuntimeError) as e:
+                debug_print(f"【严重错误】EGNN模型加载失败: {e}", "CRITICAL")
                 debug_print("        解决方案：", "CRITICAL")
                 debug_print("        1. 运行冷启动生成训练数据", "CRITICAL")
                 debug_print("        2. 运行 EGNN_1.py 准备数据", "CRITICAL")
                 debug_print("        3. 运行 EGNN_23.py 训练模型", "CRITICAL")
                 raise RuntimeError(
-                    "EGNN模型未加载。请先运行冷启动生成训练数据，"
-                    "然后运行EGNN_1.py和EGNN_23.py训练模型。"
-                )
-            else:
-                debug_print("✓ EGNN模型加载成功", "INFO")
+                    f"EGNN模型未加载: {e}"
+                ) from e
         
         # 使用EGNN预测
         from ligand_generator import generate_ligand
@@ -422,6 +417,7 @@ class Phase2Engine:
             positions = list(state.disulfide_bonds[0]) if state.disulfide_bonds else None
         else:
             xlinker = state.crosslinker
+            # 【修复】使用 config.CROSSLINKER_POSITIONS
             positions = config.CROSSLINKER_POSITIONS if xlinker else None
         
         debug_print(f"生成分子: sequence={state.sequence[:20]}..., xlinker={xlinker}", "INFO")
@@ -774,6 +770,7 @@ class Phase2Engine:
         print("="*60)
         print(f"阶段二：MCTS三层决策闭环搜索")
         print(f"靶点: {self.target_name}")
+        print(f"配置交联剂: {config.CROSSLINKER}")
         print("="*60)
         
         # 检查是否需要冷启动

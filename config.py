@@ -73,7 +73,7 @@ ESMIF_MODEL_URL = "https://dl.fbaipublicfiles.com/fair-esm/models/esm_if1_gvp4_t
 # =============================================================================
 TOOLS = {
     "fpocket": "fpocket",  # fpocket 可执行文件路径
-    "obabel": "/home/ilano/miniconda3/envs/AA/bin/obabel",  # Open Babel (AA 环境)
+    "obabel": "/usr/bin/obabel",  # Open Babel (AA 环境)
     "vina": "/home/ilano/miniconda3/envs/AA/bin/vina",      # AutoDock Vina (AA 环境)
     "babel_libdir": "/home/ilano/miniconda3/envs/AA/lib/openbabel/2.4.1",  # OpenBabel插件目录
 }
@@ -87,7 +87,7 @@ TOOLS = {
 # - 大写字母：固定氨基酸（如 A, C, G）
 # - x：可变位置，由 MCTS 搜索确定
 # 环肽格式：ACX₆CX₆CG（16个氨基酸，3个固定Cys，使用TBMB交联剂形成单环）
-PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
+PEPTIDE_TEMPLATE = "ACxxxCxxxCG"
 
 # 固定位置映射：{位置索引: 氨基酸}
 # 位置从0开始计数
@@ -95,9 +95,9 @@ PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
 FIXED_POSITIONS = {
     0: "A",   # N端
     1: "C",   # 第一个半胱氨酸（TBMB连接位点1）
-    8: "C",   # 第二个半胱氨酸（TBMB连接位点2）
-    15: "C",  # C端
-    16: "G"
+    5: "C",   # 第二个半胱氨酸（TBMB连接位点2）
+    9: "C",  # C端
+    10: "G"
 }
 
 # 可变位置（模板中 'x' 的位置）
@@ -164,7 +164,7 @@ CROSSLINKER = "TBMB"
 # 交联剂连接位置（TBMB需要3个Cys）
 # ACX₆CX₆CG格式：Cys位于位置1, 8，第三个Cys需要在可变区域中指定
 # 这里配置前两个固定Cys的位置，第三个将在扩展时从可变区域选择
-CROSSLINKER_POSITIONS = [1, 8,15]  # 基础位置，第三个Cys在可变区域中确定
+CROSSLINKER_POSITIONS = [1, 5,9]  # 基础位置，第三个Cys在可变区域中确定
 
 # =============================================================================
 # 分子量筛选范围（Da）
@@ -216,7 +216,7 @@ ACTIVE_LEARNING_CONFIG = {
 PARALLEL_VINA_CONFIG = {
     "num_workers": 12,           # 默认并行工作进程数（CPU 核心数）
     "cpu_per_worker": 1,         # 每个 Vina 进程使用的 CPU 数
-    "timeout": 300,              # 每个分子对接超时时间（秒）
+    "timeout": 3000,              # 每个分子对接超时时间（秒）
 }
 
 # =============================================================================
@@ -234,14 +234,14 @@ SCORING_WEIGHTS = {
 # Vina 对接配置
 # =============================================================================
 VINA_CONFIG = {
-    "exhaustiveness": 4,       # 搜索详尽度
+    "exhaustiveness": 2,       # 搜索详尽度
     "num_modes": 9,             # 输出构象数量
     "energy_range": 4,          # 能量范围（kcal/mol）
-    "cpu": 4,                   # 使用CPU核心数
+    "cpu": 10,                   # 使用CPU核心数
 }
 
 # 对接盒子默认尺寸（Å），实际从 fpocket 结果计算
-VINA_BOX_SIZE = (20, 20, 20)
+VINA_BOX_SIZE = (14, 14, 14)
 
 # =============================================================================
 # 氨基酸物理化学性质（用于启发式评分）

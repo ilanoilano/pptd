@@ -31,7 +31,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 sys.path.insert(0, str(Path(__file__).parent))

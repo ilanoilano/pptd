@@ -166,9 +166,21 @@ class EGNNPredictor:
         print(f"[EGNNPredictor] 正在加载EGNN模型: {self.model_path}")
         
         if not self.model_path.exists():
-            print(f"[EGNNPredictor] 【错误】模型文件不存在！")
-            print(f"[EGNNPredictor]         路径: {self.model_path}")
-            print(f"[EGNNPredictor]         请确保已经运行EGNN_23.py训练模型")
+            print(f"\n{'='*60}")
+            print(f"【EGNN错误】模型文件不存在")
+            print(f"{'='*60}")
+            print(f"  期望路径: {self.model_path}")
+            print(f"\n  可能原因:")
+            print(f"    1. EGNN训练未完成，模型文件未生成")
+            print(f"    2. 模型文件被删除或移动")
+            print(f"    3. 路径配置错误")
+            print(f"\n  解决方案:")
+            print(f"    1. 运行EGNN数据准备:")
+            print(f"       python EGNN_1.py")
+            print(f"    2. 运行EGNN模型训练:")
+            print(f"       python EGNN_23.py")
+            print(f"    3. 检查模型路径: ls -la egnn/models/")
+            print(f"{'='*60}\n")
             raise FileNotFoundError(f"EGNN模型不存在: {self.model_path}")
         
         try:
@@ -186,8 +198,20 @@ class EGNNPredictor:
             
             # 检查checkpoint内容
             if 'model_state_dict' not in checkpoint:
-                print(f"[EGNNPredictor] 【错误】checkpoint格式不正确！")
-                print(f"[EGNNPredictor]         可用键: {list(checkpoint.keys())}")
+                print(f"\n{'='*60}")
+                print(f"【EGNN错误】Checkpoint格式不正确")
+                print(f"{'='*60}")
+                print(f"  模型路径: {self.model_path}")
+                print(f"  可用键: {list(checkpoint.keys())}")
+                print(f"\n  可能原因:")
+                print(f"    1. 模型文件损坏")
+                print(f"    2. 使用不同版本的PyTorch保存/加载")
+                print(f"    3. 训练过程中断，文件不完整")
+                print(f"\n  解决方案:")
+                print(f"    1. 删除损坏的模型文件并重新训练")
+                print(f"    2. 检查PyTorch版本兼容性")
+                print(f"    3. 重新运行: python EGNN_23.py")
+                print(f"{'='*60}\n")
                 raise KeyError("checkpoint中缺少'model_state_dict'")
             
             self.model.load_state_dict(checkpoint['model_state_dict'])
@@ -200,7 +224,21 @@ class EGNNPredictor:
             print(f"[EGNNPredictor]   层数: {self.num_layers}")
             
         except Exception as e:
-            print(f"[EGNNPredictor] 【错误】模型加载失败: {e}")
+            print(f"\n{'='*60}")
+            print(f"【EGNN错误】模型加载失败")
+            print(f"{'='*60}")
+            print(f"  异常类型: {type(e).__name__}")
+            print(f"  异常信息: {e}")
+            print(f"  模型路径: {self.model_path}")
+            print(f"\n  可能原因:")
+            print(f"    1. PyTorch版本不兼容")
+            print(f"    2. 模型文件损坏")
+            print(f"    3. CUDA/CPU设备不匹配")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查PyTorch版本: python -c 'import torch; print(torch.__version__)'")
+            print(f"    2. 重新训练模型: python EGNN_23.py")
+            print(f"    3. 检查CUDA可用性: python -c 'import torch; print(torch.cuda.is_available())'")
+            print(f"{'='*60}\n")
             raise
     
     def predict(self, pdbqt_path: Path) -> float:
@@ -216,7 +254,19 @@ class EGNNPredictor:
         print(f"[EGNNPredictor] 开始预测: {pdbqt_path.name}")
         
         if not pdbqt_path.exists():
-            print(f"[EGNNPredictor] 【错误】PDBQT文件不存在: {pdbqt_path}")
+            print(f"\n{'='*60}")
+            print(f"【EGNN错误】PDBQT文件不存在")
+            print(f"{'='*60}")
+            print(f"  期望路径: {pdbqt_path}")
+            print(f"\n  可能原因:")
+            print(f"    1. 配体生成失败")
+            print(f"    2. 文件路径错误")
+            print(f"    3. 临时文件被清理")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查 ligand_generator.py 是否正常工作")
+            print(f"    2. 检查临时目录权限")
+            print(f"    3. 重新生成分子")
+            print(f"{'='*60}\n")
             raise FileNotFoundError(f"PDBQT文件不存在: {pdbqt_path}")
         
         try:
@@ -252,30 +302,53 @@ class EGNNPredictor:
             return energy
             
         except Exception as e:
-            print(f"[EGNNPredictor] 【错误】预测失败: {e}")
-            print(f"[EGNNPredictor]         文件: {pdbqt_path}")
+            print(f"\n{'='*60}")
+            print(f"【EGNN错误】预测失败")
+            print(f"{'='*60}")
+            print(f"  异常类型: {type(e).__name__}")
+            print(f"  异常信息: {e}")
+            print(f"  文件: {pdbqt_path}")
+            print(f"\n  可能原因:")
+            print(f"    1. PDBQT文件格式错误")
+            print(f"    2. 原子数过多（内存不足）")
+            print(f"    3. 模型输入维度不匹配")
+            print(f"    4. CUDA/CPU设备错误")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查PDBQT文件: cat {pdbqt_path} | head -20")
+            print(f"    2. 检查原子数: grep -c '^ATOM' {pdbqt_path}")
+            print(f"    3. 验证模型输入维度")
+            print(f"    4. 检查设备可用性")
+            print(f"{'='*60}\n")
             raise
 
 
-def create_egnn_predictor() -> Optional[EGNNPredictor]:
+def create_egnn_predictor() -> EGNNPredictor:
     """
     创建EGNN预测器（如果模型存在）
     
     Returns:
-        EGNNPredictor实例，如果模型不存在返回None
+        EGNNPredictor实例
+    
+    Raises:
+        FileNotFoundError: 如果模型文件不存在
+        RuntimeError: 如果模型加载失败
     """
     model_path = config.BASE_DIR / "egnn" / "models" / "best_model.pt"
     
     if not model_path.exists():
-        print(f"警告: EGNN模型不存在: {model_path}")
-        print("  请先运行EGNN训练")
-        return None
+        print(f"【EGNN错误】模型文件不存在: {model_path}")
+        print("  请先运行以下步骤训练模型:")
+        print("    1. python EGNN_1.py  # 准备数据")
+        print("    2. python EGNN_23.py  # 训练模型")
+        raise FileNotFoundError(f"EGNN模型不存在: {model_path}")
     
     try:
-        return EGNNPredictor(model_path)
+        predictor = EGNNPredictor(model_path)
+        print(f"【EGNN】模型加载成功: {model_path}")
+        return predictor
     except Exception as e:
-        print(f"错误: 无法加载EGNN模型: {e}")
-        return None
+        print(f"【EGNN错误】模型加载失败: {e}")
+        raise RuntimeError(f"无法加载EGNN模型: {e}") from e
 
 
 def main():

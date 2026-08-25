@@ -4,6 +4,8 @@
 Vina对接集成模块 (vina.py)
 功能：序列 → 3D构象 → PDBQT → Vina对接 → 结合能
 
+【修复】所有Vina参数默认从 config.VINA_CONFIG 读取，确保配置一致性
+
 支持：
 1. 实时对接进度输出（使用Popen实时读取）
 2. 多核CPU并行（单进程多核 + 多进程并行）
@@ -62,8 +64,37 @@ def get_vina_paths(target_name: str) -> Dict[str, Path]:
     vina_config = dirs["vina"] / "vina_config.txt"
     
     if not receptor_pdbqt.exists():
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】受体文件不存在")
+        print(f"{'='*60}")
+        print(f"  期望路径: {receptor_pdbqt}")
+        print(f"  靶点名称: {target_name}")
+        print(f"\n  可能原因:")
+        print(f"    1. 阶段一未运行，受体文件未生成")
+        print(f"    2. 靶点名称拼写错误")
+        print(f"    3. 受体文件被删除或移动")
+        print(f"\n  解决方案:")
+        print(f"    1. 先运行阶段一准备受体:")
+        print(f"       python run_phase1.py -t {target_name}")
+        print(f"    2. 检查靶点名称是否正确")
+        print(f"    3. 检查 results/{target_name}/vina/ 目录")
+        print(f"{'='*60}\n")
         raise FileNotFoundError(f"受体文件不存在: {receptor_pdbqt}")
+    
     if not vina_config.exists():
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】配置文件不存在")
+        print(f"{'='*60}")
+        print(f"  期望路径: {vina_config}")
+        print(f"  靶点名称: {target_name}")
+        print(f"\n  可能原因:")
+        print(f"    1. 阶段一未运行，配置文件未生成")
+        print(f"    2. 配置文件被删除")
+        print(f"\n  解决方案:")
+        print(f"    1. 先运行阶段一准备受体:")
+        print(f"       python run_phase1.py -t {target_name}")
+        print(f"    2. 检查 results/{target_name}/vina/ 目录")
+        print(f"{'='*60}\n")
         raise FileNotFoundError(f"配置文件不存在: {vina_config}")
     
     return {
@@ -77,11 +108,16 @@ def run_vina_with_progress(ligand_pdbqt: Path,
                            vina_config: Path,
                            output_pdbqt: Optional[Path] = None,
                            timeout: int = 300,
-                           n_cpu: int = 1,
+                           n_cpu: Optional[int] = None,
+                           exhaustiveness: Optional[int] = None,
+                           num_modes: Optional[int] = None,
+                           energy_range: Optional[int] = None,
                            verbose: bool = True,
                            sequence: str = "") -> VinaResult:
     """
     运行Vina对接，实时输出进度
+    
+    【修复】所有参数默认从 config.VINA_CONFIG 读取
     
     Args:
         ligand_pdbqt: 配体PDBQT路径
@@ -89,7 +125,10 @@ def run_vina_with_progress(ligand_pdbqt: Path,
         vina_config: Vina配置文件路径
         output_pdbqt: 输出文件路径
         timeout: 超时时间（秒）
-        n_cpu: 使用的CPU核心数
+        n_cpu: 使用的CPU核心数（默认从config读取）
+        exhaustiveness: 搜索详尽度（默认从config读取）
+        num_modes: 输出构象数量（默认从config读取）
+        energy_range: 能量范围（默认从config读取）
         verbose: 是否打印详细输出
         sequence: 序列信息（用于日志）
     
@@ -100,13 +139,55 @@ def run_vina_with_progress(ligand_pdbqt: Path,
     receptor_pdbqt = Path(receptor_pdbqt)
     vina_config = Path(vina_config)
     
+    # 【修复】从 config 读取默认值
+    if n_cpu is None:
+        n_cpu = config.VINA_CONFIG.get("cpu", 4)
+    if exhaustiveness is None:
+        exhaustiveness = config.VINA_CONFIG.get("exhaustiveness", 4)
+    if num_modes is None:
+        num_modes = config.VINA_CONFIG.get("num_modes", 9)
+    if energy_range is None:
+        energy_range = config.VINA_CONFIG.get("energy_range", 4)
+    
     # 检查文件
     if not ligand_pdbqt.exists():
-        return VinaResult(0, None, False, f"配体文件不存在: {ligand_pdbqt}", sequence)
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】配体文件不存在")
+        print(f"{'='*60}")
+        print(f"  期望路径: {ligand_pdbqt}")
+        print(f"\n  可能原因:")
+        print(f"    1. 配体生成失败，PDBQT文件未创建")
+        print(f"    2. 配体生成后文件被删除")
+        print(f"    3. 临时目录权限问题")
+        print(f"\n  解决方案:")
+        print(f"    1. 检查 ligand_generator.py 是否正常工作")
+        print(f"    2. 检查临时目录权限")
+        print(f"    3. 手动检查文件是否存在: ls -la {ligand_pdbqt.parent}")
+        print(f"{'='*60}\n")
+        raise FileNotFoundError(f"配体文件不存在: {ligand_pdbqt}")
+    
     if not receptor_pdbqt.exists():
-        return VinaResult(0, None, False, f"受体文件不存在: {receptor_pdbqt}", sequence)
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】受体文件不存在")
+        print(f"{'='*60}")
+        print(f"  期望路径: {receptor_pdbqt}")
+        print(f"\n  可能原因:")
+        print(f"    1. 阶段一未运行")
+        print(f"    2. 受体文件被删除")
+        print(f"\n  解决方案:")
+        print(f"    运行: python run_phase1.py -t {target_name}")
+        print(f"{'='*60}\n")
+        raise FileNotFoundError(f"受体文件不存在: {receptor_pdbqt}")
+    
     if not vina_config.exists():
-        return VinaResult(0, None, False, f"配置文件不存在: {vina_config}", sequence)
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】配置文件不存在")
+        print(f"{'='*60}")
+        print(f"  期望路径: {vina_config}")
+        print(f"\n  解决方案:")
+        print(f"    运行: python run_phase1.py -t {target_name}")
+        print(f"{'='*60}\n")
+        raise FileNotFoundError(f"配置文件不存在: {vina_config}")
     
     # 输出文件
     if output_pdbqt is None:
@@ -117,19 +198,22 @@ def run_vina_with_progress(ligand_pdbqt: Path,
     # Vina路径
     vina_exe = config.TOOLS.get("vina", "vina")
     
-    # 构建命令（使用多核）
+    # 构建命令（使用config中的参数）
     cmd = [
         vina_exe,
         "--receptor", str(receptor_pdbqt),
         "--ligand", str(ligand_pdbqt),
         "--config", str(vina_config),
         "--out", str(output_pdbqt),
-        "--cpu", str(n_cpu)
+        "--cpu", str(n_cpu),
+        "--exhaustiveness", str(exhaustiveness),
+        "--num_modes", str(num_modes),
+        "--energy_range", str(energy_range)
     ]
     
     if verbose:
         seq_info = f"[{sequence}] " if sequence else ""
-        print(f"\n{seq_info}启动Vina对接 (CPU={n_cpu})...")
+        print(f"\n{seq_info}启动Vina对接 (CPU={n_cpu}, exhaustiveness={exhaustiveness})...")
         print(f"  命令: {' '.join(cmd)}")
     
     # 设置环境变量
@@ -170,7 +254,28 @@ def run_vina_with_progress(ligand_pdbqt: Path,
         
         if returncode != 0:
             error_msg = "\n".join(stdout_lines[-10:]) if stdout_lines else "无错误输出"
-            return VinaResult(0, None, False, f"Vina返回错误码 {returncode}: {error_msg}", sequence)
+            print(f"\n{'='*60}")
+            print(f"【Vina错误】Vina进程返回非零退出码")
+            print(f"{'='*60}")
+            print(f"  返回码: {returncode}")
+            print(f"  序列: {sequence}")
+            print(f"  配体: {ligand_pdbqt}")
+            print(f"  受体: {receptor_pdbqt}")
+            print(f"\n  最后10行输出:")
+            for i, line in enumerate(stdout_lines[-10:], 1):
+                print(f"    {i}: {line}")
+            print(f"\n  可能原因:")
+            print(f"    1. Vina命令参数错误")
+            print(f"    2. 配体/受体文件格式不兼容")
+            print(f"    3. 对接盒子配置错误（中心/大小）")
+            print(f"    4. 内存不足")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查配体PDBQT格式: obabel {ligand_pdbqt} -opdbqt")
+            print(f"    2. 检查受体PDBQT格式: obabel {receptor_pdbqt} -opdbqt")
+            print(f"    3. 检查Vina配置文件的盒子参数")
+            print(f"    4. 尝试减少exhaustiveness参数")
+            print(f"{'='*60}\n")
+            raise RuntimeError(f"Vina返回错误码 {returncode}: {error_msg}")
         
         # 解析结合能
         binding_energy = None
@@ -186,7 +291,24 @@ def run_vina_with_progress(ligand_pdbqt: Path,
                     continue
         
         if binding_energy is None:
-            return VinaResult(0, None, False, "无法从Vina输出解析结合能", sequence)
+            print(f"\n{'='*60}")
+            print(f"【Vina错误】无法从输出中解析结合能")
+            print(f"{'='*60}")
+            print(f"  序列: {sequence}")
+            print(f"  配体: {ligand_pdbqt}")
+            print(f"  受体: {receptor_pdbqt}")
+            print(f"\n  Vina输出内容（前500字符）:")
+            print(f"  {stdout_text[:500]}")
+            print(f"\n  可能原因:")
+            print(f"    1. Vina输出格式异常（版本不兼容？）")
+            print(f"    2. Vina未能成功对接（配体/受体问题）")
+            print(f"    3. Vina输出被截断")
+            print(f"\n  解决方案:")
+            print(f"    1. 检查Vina版本: vina --version")
+            print(f"    2. 手动运行Vina查看完整输出")
+            print(f"    3. 检查配体和受体文件是否有效")
+            print(f"{'='*60}\n")
+            raise RuntimeError("无法从Vina输出解析结合能，可能是Vina执行失败或输出格式异常")
         
         if verbose:
             seq_info = f"[{sequence}] " if sequence else ""
@@ -195,17 +317,55 @@ def run_vina_with_progress(ligand_pdbqt: Path,
         return VinaResult(binding_energy, output_pdbqt, True, "", sequence)
         
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        return VinaResult(0, None, False, f"Vina对接超时（{timeout}秒）", sequence)
+        if proc is not None:
+            proc.kill()
+            proc.communicate()
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】对接超时")
+        print(f"{'='*60}")
+        print(f"  超时时间: {timeout} 秒")
+        print(f"  序列: {sequence}")
+        print(f"  配体: {ligand_pdbqt}")
+        print(f"  受体: {receptor_pdbqt}")
+        print(f"\n  可能原因:")
+        print(f"    1. 分子过大，对接计算量过大")
+        print(f"    2. exhaustiveness设置过高")
+        print(f"    3. CPU资源不足")
+        print(f"    4. Vina进程死锁（OpenMP问题）")
+        print(f"\n  解决方案:")
+        print(f"    1. 增加超时时间: timeout={timeout*2}")
+        print(f"    2. 降低exhaustiveness（默认{exhaustiveness}，尝试减半）")
+        print(f"    3. 使用更少的CPU核心: n_cpu=1")
+        print(f"    4. 检查系统负载: top 或 htop")
+        print(f"{'='*60}\n")
+        raise RuntimeError(f"对接超时（{timeout}秒）")
+    
     except Exception as e:
-        if 'proc' in locals():
+        if 'proc' in locals() and proc is not None:
             try:
                 proc.kill()
                 proc.communicate()
             except:
                 pass
-        return VinaResult(0, None, False, f"Vina执行异常: {e}", sequence)
+        print(f"\n{'='*60}")
+        print(f"【Vina错误】执行异常")
+        print(f"{'='*60}")
+        print(f"  异常类型: {type(e).__name__}")
+        print(f"  异常信息: {e}")
+        print(f"  序列: {sequence}")
+        print(f"  配体: {ligand_pdbqt}")
+        print(f"  受体: {receptor_pdbqt}")
+        print(f"\n  可能原因:")
+        print(f"    1. Vina可执行文件不存在或权限不足")
+        print(f"    2. 系统资源不足（内存/磁盘）")
+        print(f"    3. 输入文件损坏")
+        print(f"\n  解决方案:")
+        print(f"    1. 检查Vina安装: which vina")
+        print(f"    2. 检查磁盘空间: df -h")
+        print(f"    3. 检查内存使用: free -h")
+        print(f"    4. 验证输入文件完整性")
+        print(f"{'='*60}\n")
+        raise RuntimeError(f"Vina执行异常: {e}") from e
 
 
 def vina_dock(sequence: str,
@@ -214,10 +374,13 @@ def vina_dock(sequence: str,
               crosslinker_positions: Optional[list] = None,
               output_dir: Optional[Path] = None,
               timeout: int = 300,
-              n_cpu: int = 1,
+              n_cpu: Optional[int] = None,
+              exhaustiveness: Optional[int] = None,
               verbose: bool = False) -> float:
     """
     主函数：序列 → Vina结合能
+    
+    【修复】所有参数默认从 config 读取
     
     Args:
         sequence: 完整氨基酸序列
@@ -226,7 +389,8 @@ def vina_dock(sequence: str,
         crosslinker_positions: Cys连接位置（默认从config读取）
         output_dir: 输出目录（可选）
         timeout: 超时时间（秒）
-        n_cpu: 使用的CPU核心数
+        n_cpu: 使用的CPU核心数（默认从config读取）
+        exhaustiveness: 搜索详尽度（默认从config读取）
         verbose: 是否打印详细信息
     
     Returns:
@@ -241,11 +405,18 @@ def vina_dock(sequence: str,
         print(f"靶点: {target_name}")
         print(f"{'='*60}")
     
-    # 使用默认交联剂配置
+    # 【修复】从 config 读取所有默认值
     if crosslinker is None:
         crosslinker = config.CROSSLINKER
     if crosslinker_positions is None:
         crosslinker_positions = config.CROSSLINKER_POSITIONS
+    if n_cpu is None:
+        n_cpu = config.VINA_CONFIG.get("cpu", 4)
+    if exhaustiveness is None:
+        exhaustiveness = config.VINA_CONFIG.get("exhaustiveness", 4)
+    
+    if verbose:
+        print(f"  配置: CPU={n_cpu}, exhaustiveness={exhaustiveness}")
     
     try:
         # 1. 获取Vina路径
@@ -275,6 +446,7 @@ def vina_dock(sequence: str,
             vina_config=vina_paths['config'],
             timeout=timeout,
             n_cpu=n_cpu,
+            exhaustiveness=exhaustiveness,
             verbose=verbose,
             sequence=sequence
         )
@@ -292,7 +464,8 @@ def vina_dock(sequence: str,
     except Exception as e:
         if verbose:
             print(f"  ✗ 异常: {e}")
-        return 0.0
+        # 【关键】不要返回0，而是抛出异常，避免调用者误用
+        raise RuntimeError(f"Vina对接失败: {e}") from e
 
 
 def dock_single_worker(args):
@@ -300,12 +473,12 @@ def dock_single_worker(args):
     单进程工作函数（用于多进程并行）
     
     Args:
-        args: (sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu)
+        args: (sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness)
     
     Returns:
         (sequence, energy)
     """
-    sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu = args
+    sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness = args
     
     energy = vina_dock(
         sequence=sequence,
@@ -315,6 +488,7 @@ def dock_single_worker(args):
         output_dir=output_dir,
         timeout=timeout,
         n_cpu=n_cpu,
+        exhaustiveness=exhaustiveness,
         verbose=True  # 每个进程都输出进度
     )
     
@@ -325,18 +499,20 @@ def batch_vina_dock_parallel(sequences: List[str],
                              target_name: str,
                              output_file: Optional[Path] = None,
                              n_workers: Optional[int] = None,
-                             n_cpu_per_worker: int = 1,
+                             n_cpu_per_worker: Optional[int] = None,
                              timeout: int = 300,
                              verbose: bool = True) -> Dict[str, float]:
     """
     批量对接多个序列（多进程并行）
     
+    【修复】所有参数默认从 config 读取
+    
     Args:
         sequences: 序列列表
         target_name: 靶点名称
         output_file: 结果保存路径（可选）
-        n_workers: 并行工作进程数（默认使用CPU核心数）
-        n_cpu_per_worker: 每个Vina进程使用的CPU数
+        n_workers: 并行工作进程数（默认从config读取）
+        n_cpu_per_worker: 每个Vina进程使用的CPU数（默认从config读取）
         timeout: 每个分子对接超时时间（秒）
         verbose: 是否打印详细信息
     
@@ -345,8 +521,11 @@ def batch_vina_dock_parallel(sequences: List[str],
     """
     import multiprocessing
     
+    # 【修复】从 config 读取默认值
     if n_workers is None:
-        n_workers = min(multiprocessing.cpu_count(), len(sequences))
+        n_workers = config.PARALLEL_VINA_CONFIG.get("num_workers", multiprocessing.cpu_count())
+    if n_cpu_per_worker is None:
+        n_cpu_per_worker = config.PARALLEL_VINA_CONFIG.get("cpu_per_worker", 1)
     
     print("="*60)
     print(f"批量Vina对接（并行模式）")
@@ -360,11 +539,12 @@ def batch_vina_dock_parallel(sequences: List[str],
     # 准备参数
     crosslinker = config.CROSSLINKER
     crosslinker_positions = config.CROSSLINKER_POSITIONS
+    exhaustiveness = config.VINA_CONFIG.get("exhaustiveness", 4)
     output_dir = config.BASE_DIR / "temp" / "vina_dock"
     output_dir.mkdir(parents=True, exist_ok=True)
     
     args_list = [
-        (seq, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu_per_worker)
+        (seq, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu_per_worker, exhaustiveness)
         for seq in sequences
     ]
     
@@ -418,11 +598,13 @@ def batch_vina_dock(sequences: List[str],
                     output_file: Optional[Path] = None,
                     parallel: bool = False,
                     n_workers: Optional[int] = None,
-                    n_cpu_per_worker: int = 1,
+                    n_cpu_per_worker: Optional[int] = None,
                     timeout: int = 300,
                     verbose: bool = False) -> Dict[str, float]:
     """
     批量对接（支持串行和并行模式）
+    
+    【修复】所有参数默认从 config 读取
     
     Args:
         sequences: 序列列表
@@ -471,6 +653,10 @@ def main():
     """命令行入口"""
     import argparse
     
+    # 【修复】从 config 读取默认值
+    default_cpu = config.VINA_CONFIG.get("cpu", 4)
+    default_exhaustiveness = config.VINA_CONFIG.get("exhaustiveness", 4)
+    
     parser = argparse.ArgumentParser(description='Vina对接集成')
     parser.add_argument('-s', '--sequence', type=str, default=None,
                        help='氨基酸序列（单分子模式）')
@@ -484,8 +670,10 @@ def main():
                        help='输出文件')
     parser.add_argument('--timeout', type=int, default=300,
                        help='超时时间（秒）')
-    parser.add_argument('--cpu', type=int, default=1,
-                       help='单进程使用的CPU数')
+    parser.add_argument('--cpu', type=int, default=default_cpu,
+                       help=f'单进程使用的CPU数（默认: {default_cpu}）')
+    parser.add_argument('--exhaustiveness', type=int, default=default_exhaustiveness,
+                       help=f'搜索详尽度（默认: {default_exhaustiveness}）')
     parser.add_argument('--parallel', action='store_true',
                        help='使用并行模式')
     parser.add_argument('--workers', type=int, default=None,
@@ -503,6 +691,7 @@ def main():
             crosslinker=args.crosslinker,
             timeout=args.timeout,
             n_cpu=args.cpu,
+            exhaustiveness=args.exhaustiveness,
             verbose=args.verbose
         )
         print(f"\n结合能: {energy:.4f} kcal/mol")
