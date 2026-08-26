@@ -11,6 +11,8 @@ MCTS Expansion模块 V2 (expansion.py)
 """
 
 import sys
+import random
+import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Callable, Tuple
 
@@ -22,14 +24,17 @@ from peptide_state import MCTSNode, PeptideState, CROSSLINKER_TYPES, CROSSLINKER
 
 class ExpansionEngine:
     """
-    MCTS扩展引擎 V2 - 支持三层决策
+    MCTS扩展引擎 V3 - 支持EGNN先验指导
     """
     
     def __init__(self,
                  template: Optional[str] = None,
                  fixed_positions: Optional[Dict[int, str]] = None,
                  variable_amino_acids: Optional[Dict[int, List[str]]] = None,
-                 prior_policy: Optional[Callable] = None):
+                 prior_policy: Optional[Callable] = None,
+                 egnn_model: Optional[Callable] = None,
+                 use_egnn_prior: bool = True,
+                 prior_temperature: float = 1.0):
         """
         初始化扩展引擎
         
@@ -37,12 +42,33 @@ class ExpansionEngine:
             template: 序列模板
             fixed_positions: 固定位置映射
             variable_amino_acids: 每个位置允许的氨基酸
-            prior_policy: 先验策略函数
+            prior_policy: 先验策略函数（可选，与egnn_model互斥）
+            egnn_model: EGNN预测函数，用于计算先验概率
+            use_egnn_prior: 是否使用EGNN作为先验
+            prior_temperature: 先验温度参数，控制探索程度（越大越均匀）
         """
         self.template = template or config.PEPTIDE_TEMPLATE
         self.fixed_positions = fixed_positions or config.FIXED_POSITIONS
         self.variable_amino_acids = variable_amino_acids or config.VARIABLE_AMINO_ACIDS
         self.prior_policy = prior_policy
+        self.egnn_model = egnn_model
+        self.use_egnn_prior = use_egnn_prior and (egnn_model is not None)
+        self.prior_temperature = prior_temperature
+        
+        # 缓存EGNN预测结果，避免重复计算
+        self._egnn_cache = {}
+        
+        # 统计信息
+        self._egnn_calls = 0
+        self._cache_hits = 0
+        
+        if self.use_egnn_prior:
+            print(f"【ExpansionEngine】使用EGNN先验指导扩展")
+            print(f"  温度参数: {prior_temperature}")
+        elif prior_policy is not None:
+            print(f"【ExpansionEngine】使用自定义先验策略")
+        else:
+            print(f"【ExpansionEngine】警告：无先验策略，使用均匀分布")
     
     def get_next_variable_position(self, sequence: str) -> Optional[int]:
         """获取下一个可变位置（'_'或'x'）"""
@@ -78,22 +104,111 @@ class ExpansionEngine:
         
         Returns:
             先验概率
-        
-        Note:
-            如果prior_policy未设置，输出警告并返回1.0（均匀分布）
         """
+        # 优先使用自定义prior_policy
         if self.prior_policy is not None:
             return self.prior_policy(context)
         
-        # prior_policy未设置，输出警告（只输出一次）
-        if not hasattr(self, '_prior_warning_printed'):
-            print("【警告】ExpansionEngine: prior_policy未设置，使用随机采样（均匀分布）")
-            print("        当前行为：从允许的氨基酸中随机选择")
-            print("        建议：设置prior_policy以利用先验知识指导搜索")
-            print("        例如：基于物理化学性质（疏水性、电荷等）设置先验")
-            self._prior_warning_printed = True
+        # 使用EGNN先验
+        if self.use_egnn_prior and self.egnn_model is not None:
+            return self._calculate_egnn_prior(context)
         
+        # 回退到均匀分布
         return 1.0
+    
+    def _calculate_egnn_prior(self, context: dict) -> float:
+        """
+        使用EGNN计算先验概率
+        
+        策略：用EGNN预测临时序列的结合能，能量越低先验越高
+        """
+        sequence = context['sequence']
+        position = context['position']
+        amino_acid = context['amino_acid']
+        
+        # 创建临时序列（填充当前氨基酸）
+        temp_seq = self.fill_sequence(sequence, position, amino_acid)
+        
+        # 检查缓存
+        cache_key = f"{temp_seq}_{config.CROSSLINKER}"
+        if cache_key in self._egnn_cache:
+            self._cache_hits += 1
+            energy = self._egnn_cache[cache_key]
+        else:
+            # 调用EGNN预测
+            try:
+                from peptide_state import PeptideState
+                temp_state = PeptideState(
+                    sequence=temp_seq,
+                    crosslinker=config.CROSSLINKER
+                )
+                energy = self.egnn_model(temp_state)
+                self._egnn_cache[cache_key] = energy
+                self._egnn_calls += 1
+            except Exception as e:
+                # EGNN预测失败，回退到启发式
+                energy = self._heuristic_energy(temp_seq)
+        
+        # 将能量转换为先验概率
+        # 能量越低（越负），先验越高
+        # 使用softmax变换，考虑温度参数
+        prior = self._energy_to_prior(energy)
+        
+        return prior
+    
+    def _heuristic_energy(self, sequence: str) -> float:
+        """
+        启发式能量估计（EGNN失败时的回退）
+        
+        基于简单物理化学性质估计结合能
+        """
+        energy = -5.0  # 基础能量
+        
+        # 疏水性贡献（疏水氨基酸有利于结合）
+        hydrophobic = {'F', 'I', 'L', 'V', 'W', 'Y', 'A', 'M'}
+        n_hydrophobic = sum(1 for aa in sequence if aa in hydrophobic)
+        energy -= 0.1 * n_hydrophobic
+        
+        # 电荷平衡（适度电荷有利于结合）
+        charged = {'D', 'E', 'K', 'R', 'H'}
+        n_charged = sum(1 for aa in sequence if aa in charged)
+        if 2 <= n_charged <= 4:
+            energy -= 0.5  # 适度电荷奖励
+        elif n_charged > 6:
+            energy += 1.0  # 过多电荷惩罚
+        
+        # 芳香族氨基酸（常见于结合位点）
+        aromatic = {'F', 'W', 'Y'}
+        n_aromatic = sum(1 for aa in sequence if aa in aromatic)
+        energy -= 0.2 * min(n_aromatic, 3)  # 最多奖励3个
+        
+        return energy
+    
+    def _energy_to_prior(self, energy: float) -> float:
+        """
+        将结合能转换为先验概率
+        
+        使用Boltzmann分布，考虑温度参数
+        """
+        # 假设能量范围 -15 到 0 kcal/mol
+        # 归一化到 [0, 1] 范围
+        normalized_energy = max(-15.0, min(0.0, energy))
+        
+        # Boltzmann因子: exp(-E / kT)
+        # 能量越低（越负），因子越大
+        kT = self.prior_temperature  # 温度参数控制锐度
+        boltzmann = np.exp(-normalized_energy / kT)
+        
+        return boltzmann
+    
+    def get_egnn_stats(self) -> dict:
+        """获取EGNN调用统计"""
+        return {
+            'egnn_calls': self._egnn_calls,
+            'cache_hits': self._cache_hits,
+            'cache_size': len(self._egnn_cache),
+            'hit_rate': self._cache_hits / (self._egnn_calls + self._cache_hits) if (self._egnn_calls + self._cache_hits) > 0 else 0
+        }
     
     def expand_level1_single(self, node: MCTSNode, amino_acid: str, 
                               prior_prob: Optional[float] = None) -> MCTSNode:

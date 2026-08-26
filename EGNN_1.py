@@ -166,7 +166,7 @@ def process_sequence(sequence: str,
         
         # 2. 添加交联剂（如果指定）
         if crosslinker and crosslinker_positions:
-            mol = add_crosslinker(mol, crosslinker, crosslinker_positions)
+            mol = add_crosslinker(mol, crosslinker, crosslinker_positions, sequence)
         
         # 3. 生成3D构象
         mol = generate_3d_conformation(mol, random_seed)
@@ -269,11 +269,13 @@ def save_dataset(data: List[Tuple[np.ndarray, np.ndarray, float]],
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
     
+    # 【修复1】使用allow_pickle=True保存对象数组，支持不同长度的特征
     np.savez_compressed(
         output_file,
-        features=features_list,
-        coords=coords_list,
-        energies=energies
+        features=np.array(features_list, dtype=object),
+        coords=np.array(coords_list, dtype=object),
+        energies=energies,
+        allow_pickle=True
     )
     
     print(f"✓ 保存数据集: {output_file} ({len(data)} 个样本)")
