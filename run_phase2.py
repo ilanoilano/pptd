@@ -41,6 +41,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 
+# 导入MCTS日志模块
+try:
+    from mcts_logger import init_logger, close_logger, get_logger
+    from simulation import SimulationEngine
+except ImportError:
+    init_logger = None
+    close_logger = None
+    get_logger = None
+    SimulationEngine = None
+
 # =============================================================================
 # 日志配置
 # =============================================================================
@@ -178,12 +188,20 @@ class Phase2Engine:
         self.target_name = target_name
         self.target_dirs = config.get_target_dirs(target_name)
         
+        # 初始化MCTS专用日志管理器
+        if init_logger:
+            self.mcts_logger = init_logger(target_name)
+        else:
+            self.mcts_logger = None
+        
         # 设置日志
         self.logger, self.log_file = setup_logger(target_name)
         self.logger.info(f"="*60)
         self.logger.info(f"Phase2Engine 初始化")
         self.logger.info(f"靶点: {target_name}")
         self.logger.info(f"日志文件: {self.log_file}")
+        if self.mcts_logger:
+            self.logger.info(f"MCTS日志: {self.mcts_logger.log_file}")
         self.logger.info(f"="*60)
         
         # 检查第一阶段是否完成
@@ -614,7 +632,8 @@ class Phase2Engine:
             raise
     
     def mcts_iteration(self, root: MCTSNode, n_iterations: int = 100,
-                        max_expansions_per_step: Optional[int] = None) -> MCTSNode:
+                        max_expansions_per_step: Optional[int] = None,
+                        egnn_iteration: int = 1) -> MCTSNode:
         """
         运行MCTS迭代（三层决策，逐步扩展）
         
@@ -622,12 +641,17 @@ class Phase2Engine:
             root: 根节点
             n_iterations: 迭代次数
             max_expansions_per_step: 每次扩展的最大子节点数（默认从config读取）
+            egnn_iteration: 当前EGNN迭代轮次（用于日志输出）
         
         Returns:
             更新后的根节点
         """
         if max_expansions_per_step is None:
             max_expansions_per_step = config.MCTS_CONFIG.get("max_expansions", 5)
+        
+        # 设置EGNN迭代轮次
+        if SimulationEngine:
+            SimulationEngine.set_egnn_iteration(egnn_iteration)
         
         sim_engine = SimulationEngine(
             target_name=self.target_name,
@@ -1103,7 +1127,8 @@ class Phase2Engine:
                     root = self.mcts_iteration(
                         root, 
                         n_mcts_iterations,
-                        max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5)
+                        max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5),
+                        egnn_iteration=round_idx  # 传递当前EGNN迭代轮次
                     )
                     
                     # 保存检查点
@@ -1464,6 +1489,116 @@ class Phase2Engine:
             self.logger.error(f"加载恢复状态失败: {e}")
             return None
     
+    def run_iterative_loop(self, max_iterations: int = None) -> None:
+        """
+        【新增】运行迭代闭环优化（新流程）
+        
+        流程：
+        1. MCTS选择节点 → 随机补全N个序列 → EGNN预测 → 平均作为Q值
+        2. 重复选择直到填满所有可变位置（路径不重复）
+        3. 提取Top-K序列 → Vina验证
+        4. 用Vina结果微调EGNN
+        5. 计算R²和残差 → 记录日志
+        6. 检查收敛（连续N轮无改善则停止）
+        
+        Args:
+            max_iterations: 最大迭代轮数（默认从config读取）
+        """
+        if max_iterations is None:
+            max_iterations = config.MAX_EGNN_ITERATIONS
+        
+        print("\n" + "="*60)
+        print("迭代闭环优化模式（新流程）")
+        print("="*60)
+        
+        # 初始化组件
+        from simulation import SimulationEngine
+        from selection import PUCTSelector
+        from backpropagation import BackpropagationEngine
+        from peptide_state import create_root_node
+        
+        sim_engine = SimulationEngine(
+            target_name=self.target_name,
+            egnn_model=self._egnn_predict
+        )
+        selector = PUCTSelector(c_puct=config.MCTS_CONFIG["c_puct"])
+        backprop_engine = BackpropagationEngine(verbose=False)
+        
+        # 创建根节点
+        root = create_root_node()
+        print(f"\n创建MCTS根节点")
+        print(f"  模板: {config.PEPTIDE_TEMPLATE}")
+        print(f"  可变位置数: {config.VARIABLE_POSITIONS_COUNT}")
+        
+        # 收敛追踪
+        r2_best = -float('inf')
+        mae_best = float('inf')
+        patience_counter = 0
+        
+        # 运行迭代
+        for iteration in range(max_iterations):
+            print(f"\n{'='*60}")
+            print(f"EGNN迭代轮次 {iteration + 1}/{max_iterations}")
+            print(f"{'='*60}")
+            
+            # 1. MCTS选择与随机补全
+            path = [root]
+            current = root
+            depth = 0
+            
+            while depth < config.MAX_PATH_LENGTH:
+                # 选择子节点
+                if not current.children:
+                    break
+                
+                next_node = selector.select(current)
+                if next_node is None:
+                    break
+                
+                path.append(next_node)
+                current = next_node
+                depth += 1
+                
+                # 检查是否填满
+                if current.state.is_sequence_complete:
+                    break
+            
+            print(f"  MCTS路径深度: {depth}")
+            
+            # 2. 对叶节点进行随机补全和评估
+            leaf = path[-1]
+            if not leaf.state.is_terminal:
+                # 使用simulation引擎进行评估
+                result = sim_engine.simulate(leaf, verbose=False)
+                reward = result.score
+            else:
+                reward = 1.0  # 终端节点给予最高奖励
+            
+            # 3. 回溯更新
+            backprop_engine.backpropagate(path, reward)
+            
+            # 4. 每N轮进行一次Vina验证
+            if (iteration + 1) % 5 == 0 or iteration == max_iterations - 1:
+                print(f"\n  执行Vina验证...")
+                # TODO: 实现Vina验证逻辑
+                
+                # 5. 微调EGNN
+                # TODO: 实现EGNN微调
+                
+                # 6. 计算R²和MAE
+                # TODO: 实现指标计算
+                
+                # 7. 检查收敛
+                # TODO: 实现收敛判定
+            
+            # 保存检查点
+            if (iteration + 1) % 10 == 0:
+                self.save_checkpoint(root, f"iter_{iteration+1}.json")
+        
+        print(f"\n{'='*60}")
+        print("迭代闭环优化完成")
+        print(f"{'='*60}")
+    
     def run(self, 
             n_mcts_iterations: int = 1000,
             validation_interval: int = 5000,
@@ -1546,7 +1681,8 @@ class Phase2Engine:
                 root = self.mcts_iteration(
                     root, 
                     n_mcts_iterations,
-                    max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5)
+                    max_expansions_per_step=config.MCTS_CONFIG.get("max_expansions", 5),
+                    egnn_iteration=1  # 单轮模式使用固定值1
                 )
                 
                 # 保存检查点
@@ -1652,23 +1788,27 @@ def main():
                        help='重置所有检查点和恢复状态（重新开始）')
     # 多轮闭环优化参数（默认从config读取）
     parser.add_argument('--n-rounds', type=int, 
-                       default=config.MULTI_ROUND_CONFIG['n_rounds'],
-                       help=f"MCTS-验证-重训的循环轮数（默认{config.MULTI_ROUND_CONFIG['n_rounds']}轮）")
+                       default=3,
+                       help="MCTS-验证-重训的循环轮数（默认3轮）")
     parser.add_argument('--top-n-final', type=int, 
-                       default=config.MULTI_ROUND_CONFIG['top_n_final'],
-                       help=f"每轮最终输出并验证的候选数量（默认{config.MULTI_ROUND_CONFIG['top_n_final']}个）")
+                       default=20,
+                       help="每轮最终输出并验证的候选数量（默认20个）")
     parser.add_argument('--skip-vina', action='store_true',
                        help='跳过Vina验证（仅用于测试）')
     parser.add_argument('--convergence-metric', type=str, 
-                       default=config.MULTI_ROUND_CONFIG['convergence_metric'],
+                       default='best',
                        choices=['best', 'mean', 'top3_mean', 'median'],
-                       help=f"收敛判定指标（默认{config.MULTI_ROUND_CONFIG['convergence_metric']}）")
+                       help="收敛判定指标（默认best）")
     parser.add_argument('--min-improvement', type=float, 
-                       default=config.MULTI_ROUND_CONFIG['min_improvement'],
-                       help=f"最小改善阈值（kcal/mol，默认{config.MULTI_ROUND_CONFIG['min_improvement']}）")
+                       default=0.5,
+                       help="最小改善阈值（kcal/mol，默认0.5）")
     parser.add_argument('--patience', type=int, 
-                       default=config.MULTI_ROUND_CONFIG['patience'],
-                       help=f"收敛容忍轮数（默认{config.MULTI_ROUND_CONFIG['patience']}）")
+                       default=2,
+                       help="收敛容忍轮数（默认2）")
+    
+    # 【新增】迭代闭环优化模式参数
+    parser.add_argument('--iterative-loop', action='store_true',
+                       help='使用迭代闭环优化模式（新流程：随机补全+批量Vina+EGNN微调）')
     
     args = parser.parse_args()
     
@@ -1728,6 +1868,10 @@ def main():
                 skip_vina=args.skip_vina,
                 convergence_config=convergence_config
             )
+        elif args.iterative_loop:
+            # 【新增】迭代闭环优化模式（新流程）
+            print(f"\n启动迭代闭环优化模式（新流程）")
+            engine.run_iterative_loop(max_iterations=config.MAX_EGNN_ITERATIONS)
         else:
             # 单轮MCTS搜索（兼容旧模式）
             engine.run(
@@ -1738,7 +1882,14 @@ def main():
             )
     except KeyboardInterrupt:
         print("\n训练已中断，可以使用相同命令恢复")
+        # 关闭日志
+        if close_logger:
+            close_logger()
         sys.exit(0)
+    finally:
+        # 确保日志被关闭
+        if close_logger:
+            close_logger()
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ MCTS Simulation模块 V2 (simulation.py)
 import sys
 import random
 import os
+import time
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Callable
@@ -24,6 +25,15 @@ import config
 from peptide_state import MCTSNode, PeptideState
 from ligand_generator import generate_ligand
 from egnn_predictor import create_egnn_predictor, EGNNPredictor
+from seq_generator import generate_n_random_fills
+
+# 导入MCTS日志模块
+try:
+    from mcts_logger import get_logger, log_progress, log_debug
+except ImportError:
+    get_logger = None
+    log_progress = None
+    log_debug = None
 
 
 # 【修复】使用项目目录下的临时文件夹，避免硬编码 /tmp
@@ -46,6 +56,11 @@ class SimulationEngine:
     使用MCTS确定的完整状态（序列+交联剂+二硫键）
     """
     
+    # 类级别的计数器，用于跟踪生成的分子数量
+    _molecule_counter = 0
+    _egnn_iteration = 0
+    _max_iterations = 100  # 默认最大迭代次数
+    
     def __init__(self,
                  target_name: str,
                  egnn_model: Optional[Callable] = None,
@@ -65,6 +80,31 @@ class SimulationEngine:
         # 【修复】使用项目目录下的临时文件夹
         self.temp_dir = TEMP_DIR
         self.temp_dir.mkdir(exist_ok=True)
+    
+    @classmethod
+    def increment_molecule_counter(cls):
+        """增加分子计数器"""
+        cls._molecule_counter += 1
+        return cls._molecule_counter
+    
+    @classmethod
+    def set_egnn_iteration(cls, iteration: int):
+        """设置当前EGNN迭代轮次"""
+        cls._egnn_iteration = iteration
+    
+    @classmethod
+    def set_max_iterations(cls, max_iterations: int):
+        """设置最大迭代次数"""
+        cls._max_iterations = max_iterations
+    
+    @classmethod
+    def get_stats(cls):
+        """获取统计信息"""
+        return {
+            "molecule_count": cls._molecule_counter,
+            "egnn_iteration": cls._egnn_iteration,
+            "max_iterations": cls._max_iterations
+        }
     
     def get_crosslinker_config(self, state: PeptideState) -> tuple:
         """
@@ -104,13 +144,15 @@ class SimulationEngine:
             
             return crosslinker, positions
     
-    def predict_with_egnn(self, state: PeptideState, seed: int = 42) -> float:
+    def predict_with_egnn(self, state: PeptideState, seed: int = 42, 
+                          mcts_depth: int = 0) -> float:
         """
         使用EGNN预测结合能
         
         Args:
             state: 肽状态
             seed: 随机种子（用于生成不同构象）
+            mcts_depth: MCTS当前深度
         
         Returns:
             预测结合能（kcal/mol）
@@ -118,7 +160,11 @@ class SimulationEngine:
         # 获取交联剂配置
         crosslinker, positions = self.get_crosslinker_config(state)
         
-        print(f"[Simulation] 交联剂配置: {crosslinker}, positions={positions}")
+        # 记录开始时间
+        start_time = time.time()
+        
+        # 增加分子计数
+        mol_count = self.increment_molecule_counter()
         
         try:
             # 生成分子
@@ -136,29 +182,89 @@ class SimulationEngine:
                 self.egnn_model = create_egnn_predictor()
             
             energy = self.egnn_model.predict(pdbqt_path)
+            
+            # 输出进度信息
+            if log_progress:
+                log_progress(
+                    egnn_iter=self._egnn_iteration,
+                    mcts_depth=mcts_depth,
+                    random_count=mol_count,
+                    sequence=state.sequence,
+                    energy=energy,
+                    max_iterations=self._max_iterations
+                )
+            
+            # 记录调试信息
+            if log_debug:
+                log_debug("simulation", "EGNN预测完成", {
+                    "sequence": state.sequence,
+                    "crosslinker": crosslinker,
+                    "energy": energy,
+                    "mcts_depth": mcts_depth,
+                    "generation_time": round(time.time() - start_time, 3)
+                })
+            
             return energy
             
         except Exception as e:
-            print(f"[Simulation] EGNN预测失败: {e}")
+            error_msg = f"EGNN预测失败: {e}"
+            if log_debug:
+                log_debug("simulation", error_msg, {
+                    "sequence": state.sequence,
+                    "crosslinker": crosslinker,
+                    "error": str(e)
+                })
             # 返回一个较差的分数作为惩罚
             return 0.0  # 0表示无效/失败
     
+    def _get_completion_count(self, depth: int) -> int:
+        """
+        【新增】根据当前深度计算随机补全数量N
+
+        公式: N = max(MIN_RANDOM_FILL, MAX_RANDOM_FILL - depth * FILL_DECREMENT_PER_DEPTH)
+
+        Args:
+            depth: 当前节点深度（已填充的氨基酸数）
+
+        Returns:
+            需要生成的随机序列数量
+        """
+        max_fill = config.MAX_RANDOM_FILL
+        min_fill = config.MIN_RANDOM_FILL
+        decrement = config.FILL_DECREMENT_PER_DEPTH
+
+        n = max_fill - depth * decrement
+        return max(min_fill, n)
+
+    def _random_complete(self, state: PeptideState, n: int) -> List[str]:
+        """
+        【新增】对状态进行随机补全，生成N个完整序列
+
+        Args:
+            state: 当前肽状态（含占位符）
+            n: 需要生成的序列数量
+
+        Returns:
+            N个完整序列列表
+        """
+        return generate_n_random_fills(state.sequence, n)
+
     def calculate_heuristic_score(self, state: PeptideState) -> float:
         """
         计算启发式分数（用于非终端节点）
-        
+
         基于：
         - 序列完成度
         - Cys数量（用于交联）
         - 氨基酸组成
         """
         score = 0.0
-        
+
         # 序列完成度
         completed = sum(1 for aa in state.sequence if aa != '_')
         total = len(state.sequence)
         score += 0.3 * (completed / total)
-        
+
         # Cys数量（用于交联）
         cys_count = len(state.get_cys_positions())
         if state.crosslinker in ["TBMB", "TATA"]:
@@ -170,71 +276,81 @@ class SimulationEngine:
         elif state.crosslinker == "disulfide":
             # 需要至少2个Cys
             score += 0.3 * min(cys_count / 2, 1.0)
-        
+
         # 多样性奖励（不同氨基酸类型）
         aa_types = set(state.sequence.replace('_', ''))
         score += 0.1 * min(len(aa_types) / 10, 1.0)
-        
+
         return score
     
     def simulate(self, node: MCTSNode, verbose: bool = False) -> SimulationResult:
         """
-        执行模拟（ rollout ）
-        
+        执行模拟（rollout）
+
+        【修改】新流程：
+        1. 如果非终端状态，进行随机补全生成N个序列
+        2. EGNN预测N个序列的结合能
+        3. 计算平均值作为Q值
+
         Args:
             node: MCTS节点
             verbose: 是否打印详细信息
-        
+
         Returns:
             SimulationResult
         """
         state = node.state
-        
+
         if verbose:
             print(f"\n[Simulation] 开始模拟")
             print(f"  序列: {state.sequence}")
             print(f"  交联剂: {state.crosslinker}")
-            print(f"  二硫键: {state.disulfide_bonds}")
-        
-        # 检查是否为终端状态
-        if not state.is_terminal:
-            # 非终端状态：使用启发式分数
-            score = self.calculate_heuristic_score(state)
-            if verbose:
-                print(f"  非终端状态，启发式分数: {score:.4f}")
-            return SimulationResult(
-                score=score,
-                raw_energy=0.0,
-                details={"type": "heuristic", "completion": score}
-            )
-        
-        # 终端状态：使用EGNN预测
-        energies = []
-        for i in range(self.n_simulations):
-            seed = random.randint(1, 10000)
-            energy = self.predict_with_egnn(state, seed)
-            energies.append(energy)
-            if verbose:
-                print(f"  模拟 {i+1}/{self.n_simulations}: {energy:.4f} kcal/mol")
-        
-        # 取最佳（最负）的结合能
-        best_energy = min(energies) if energies else 0.0
-        
-        # 归一化分数（假设结合能范围 -15 到 0）
-        # 越负越好，所以用 -energy
-        normalized_score = max(0.0, min(1.0, -best_energy / 15.0))
-        
+
+        # 【修改】计算当前深度和补全数量
+        depth = sum(1 for c in state.sequence if c not in ['_', 'x', 'X'])
+        n_completions = self._get_completion_count(depth)
+
         if verbose:
-            print(f"  最佳结合能: {best_energy:.4f} kcal/mol")
-            print(f"  归一化分数: {normalized_score:.4f}")
-        
+            print(f"  当前深度: {depth}, 补全数量: {n_completions}")
+
+        # 【修改】生成N个随机补全序列
+        completed_sequences = self._random_complete(state, n_completions)
+
+        if verbose:
+            print(f"  生成 {len(completed_sequences)} 个随机补全序列")
+
+        # EGNN预测所有补全序列
+        energies = []
+        for seq in completed_sequences:
+            # 创建临时状态
+            temp_state = PeptideState(
+                sequence=seq,
+                crosslinker=state.crosslinker,
+                disulfide_bonds=state.disulfide_bonds
+            )
+            energy = self.predict_with_egnn(temp_state, random.randint(1, 10000), mcts_depth=depth)
+            energies.append(energy)
+
+        # 计算平均能量作为得分
+        if energies:
+            avg_energy = sum(energies) / len(energies)
+            # 归一化到[0, 1]，能量越低越好
+            score = max(0.0, min(1.0, 1.0 - (avg_energy / -15.0)))
+        else:
+            avg_energy = 0.0
+            score = 0.0
+
+        if verbose:
+            print(f"  平均能量: {avg_energy:.2f}, 得分: {score:.4f}")
+
         return SimulationResult(
-            score=normalized_score,
-            raw_energy=best_energy,
+            score=score,
+            raw_energy=avg_energy,
             details={
-                "type": "egnn",
+                "type": "random_complete",
+                "n_completions": n_completions,
                 "energies": energies,
-                "best_energy": best_energy
+                "avg_energy": avg_energy
             }
         )
 

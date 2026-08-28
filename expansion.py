@@ -116,43 +116,98 @@ class ExpansionEngine:
         # 回退到均匀分布
         return 1.0
     
+    def _random_fill_and_evaluate(self, partial_sequence: str, n_fills: int) -> List[float]:
+        """
+        对部分序列进行随机填充，生成N个完整序列并评估
+        
+        Args:
+            partial_sequence: 部分序列（如"AC_D_C___CG"）
+            n_fills: 随机填充数量
+        
+        Returns:
+            N个预测能量值列表
+        """
+        from seq_generator import generate_n_random_fills
+        from peptide_state import PeptideState
+        
+        # 生成N个随机补全序列
+        completed_sequences = generate_n_random_fills(partial_sequence, n_fills)
+        
+        # 评估每个序列
+        energies = []
+        for seq in completed_sequences:
+            cache_key = f"{seq}_{config.CROSSLINKER}"
+            if cache_key in self._egnn_cache:
+                self._cache_hits += 1
+                energy = self._egnn_cache[cache_key]
+            else:
+                state = PeptideState(sequence=seq, crosslinker=config.CROSSLINKER)
+                try:
+                    energy = self.egnn_model(state)
+                    self._egnn_cache[cache_key] = energy
+                    self._egnn_calls += 1
+                except Exception:
+                    energy = self._heuristic_energy(seq)
+            energies.append(energy)
+        
+        return energies
+    
     def _calculate_egnn_prior(self, context: dict) -> float:
         """
-        使用EGNN计算先验概率
+        使用EGNN计算先验概率（带随机填充评估）
         
-        策略：用EGNN预测临时序列的结合能，能量越低先验越高
+        新流程:
+        1. 填充候选氨基酸到指定位置
+        2. 生成N个随机补全序列（N由深度决定）
+        3. EGNN预测所有补全序列的结合能
+        4. 计算平均能量作为该候选的先验
+        
+        Args:
+            context: 包含决策信息的字典，需包含depth字段
+        
+        Returns:
+            先验概率
         """
         sequence = context['sequence']
         position = context['position']
         amino_acid = context['amino_acid']
+        depth = context.get('depth', 0)
         
-        # 创建临时序列（填充当前氨基酸）
+        # 步骤1: 填充候选氨基酸
         temp_seq = self.fill_sequence(sequence, position, amino_acid)
         
-        # 检查缓存
-        cache_key = f"{temp_seq}_{config.CROSSLINKER}"
-        if cache_key in self._egnn_cache:
-            self._cache_hits += 1
-            energy = self._egnn_cache[cache_key]
-        else:
-            # 调用EGNN预测
-            try:
-                from peptide_state import PeptideState
-                temp_state = PeptideState(
-                    sequence=temp_seq,
-                    crosslinker=config.CROSSLINKER
-                )
-                energy = self.egnn_model(temp_state)
-                self._egnn_cache[cache_key] = energy
-                self._egnn_calls += 1
-            except Exception as e:
-                # EGNN预测失败，回退到启发式
-                energy = self._heuristic_energy(temp_seq)
+        # 步骤2: 确定随机填充数量（由深度决定）
+        try:
+            from adaptive_mcts_config import AdaptiveMCTSConfig
+            n_fills = AdaptiveMCTSConfig.get_random_fill_count(depth)
+        except ImportError:
+            # 回退到默认
+            n_fills = max(10, 50 - depth * 7)
         
-        # 将能量转换为先验概率
-        # 能量越低（越负），先验越高
-        # 使用softmax变换，考虑温度参数
-        prior = self._energy_to_prior(energy)
+        # 步骤3: 生成N个随机补全并评估
+        energies = self._random_fill_and_evaluate(temp_seq, n_fills)
+        
+        if not energies:
+            return 1.0 / len(config.ALLOWED_AMINO_ACIDS)  # 回退到均匀分布
+        
+        # 步骤4: 计算平均能量
+        avg_energy = sum(energies) / len(energies)
+        
+        # 步骤5: 转换为先验概率
+        prior = self._energy_to_prior(avg_energy)
+        
+        # 记录调试信息
+        try:
+            from mcts_logger import log_debug
+            log_debug("expansion", "随机填充评估完成", {
+                "sequence": temp_seq,
+                "depth": depth,
+                "n_fills": n_fills,
+                "avg_energy": avg_energy,
+                "prior": prior
+            })
+        except ImportError:
+            pass
         
         return prior
     
@@ -269,19 +324,25 @@ class ExpansionEngine:
         return child
     
     def expand_level1_amino_acid(self, node: MCTSNode, 
-                                  max_expansions: int = 3) -> Dict[str, MCTSNode]:
+                                  max_expansions: int = None) -> Dict[str, MCTSNode]:
         """
         第一层扩展：填充氨基酸（限制扩展数量）
         
-        只扩展最多max_expansions个子节点，而不是全部
+        V2版本修改：
+        - max_expansions默认19（排除Cys后的氨基酸数）
+        - 使用EGNN批量预测选Top-k，绝不随机选择
+        - 保证子节点不重复（记录已扩展的氨基酸）
         
         Args:
             node: 当前节点
-            max_expansions: 最大扩展数量（默认3）
+            max_expansions: 最大扩展数量（默认19）
         
         Returns:
             新创建的子节点字典
         """
+        if max_expansions is None:
+            max_expansions = config.MCTS_CONFIG.get("max_expansions", 19)
+        
         sequence = node.state.sequence
         next_pos = self.get_next_variable_position(sequence)
         
@@ -291,36 +352,34 @@ class ExpansionEngine:
         
         allowed_aas = self.get_allowed_amino_acids(next_pos)
         
-        # 找出尚未扩展的氨基酸
+        # 找出尚未扩展的氨基酸（保证不重复）
         unexpanded = [aa for aa in allowed_aas if aa not in node.children]
         
         if not unexpanded:
             return {}
         
-        # 计算先验概率
-        priors = []
-        for aa in unexpanded:
-            context = {
-                'level': 1,
-                'sequence': sequence,
-                'position': next_pos,
-                'amino_acid': aa
-            }
-            prior = self.calculate_prior(context)
-            priors.append((aa, prior))
-        
-        # 检查是否所有先验都相同（prior_policy未设置或均匀分布）
-        unique_priors = set(p for _, p in priors)
-        
-        if len(unique_priors) == 1:
-            # 先验相同，使用随机采样
-            import random
-            random.shuffle(priors)
-        else:
-            # 按先验概率排序（优先扩展高先验的）
+        # V2: 使用EGNN批量预测所有候选，选Top-k（绝不随机）
+        if self.use_egnn_prior and self.egnn_model is not None:
+            # 批量计算所有未扩展氨基酸的先验
+            priors = []
+            for aa in unexpanded:
+                context = {
+                    'level': 1,
+                    'sequence': sequence,
+                    'position': next_pos,
+                    'amino_acid': aa,
+                    'depth': sum(1 for c in sequence if c not in ['_', 'x', 'X'])
+                }
+                prior = self.calculate_prior(context)
+                priors.append((aa, prior))
+            
+            # 按先验排序（高先验 = 低能量 = 好）
             priors.sort(key=lambda x: x[1], reverse=True)
+        else:
+            # 无EGNN时均匀分布（不应该发生）
+            priors = [(aa, 1.0/len(unexpanded)) for aa in unexpanded]
         
-        # 只扩展前max_expansions个
+        # 只扩展前max_expansions个（Top-k）
         to_expand = priors[:max_expansions]
         
         # 归一化先验（在被扩展的节点中）
@@ -335,6 +394,125 @@ class ExpansionEngine:
             new_children[aa] = child
         
         return new_children
+    
+    def expand_with_softmax_allocation(
+        self,
+        nodes: List['MCTSNode'],
+        total_slots: int = 50,
+        temperature: float = 1.0
+    ) -> Dict[str, int]:
+        """
+        使用Softmax概率分配扩展名额到多个节点
+        
+        流程:
+        1. 评估每个节点的平均能量（通过随机填充）
+        2. Softmax计算概率（取绝对值）
+        3. 按概率分配total_slots个名额
+        4. 每个节点根据分配到的名额扩展子节点
+        
+        Args:
+            nodes: 待扩展的节点列表
+            total_slots: 总扩展名额（默认50）
+            temperature: Softmax温度（默认1.0）
+        
+        Returns:
+            {node_key: 分配到的名额数}
+        """
+        import numpy as np
+        
+        if not nodes:
+            return {}
+        
+        # 步骤1: 评估每个节点的平均能量
+        node_energies = []
+        for node in nodes:
+            depth = sum(1 for c in node.state.sequence if c not in ['_', 'x', 'X'])
+            
+            # 获取随机填充数量
+            try:
+                from adaptive_mcts_config import AdaptiveMCTSConfig
+                n_fills = AdaptiveMCTSConfig.get_random_fill_count(depth)
+            except ImportError:
+                n_fills = max(10, 50 - depth * 7)
+            
+            # 随机填充并评估
+            energies = self._random_fill_and_evaluate(node.state.sequence, n_fills)
+            avg_energy = sum(energies) / len(energies) if energies else -5.0
+            node_energies.append((node.state.to_key(), avg_energy))
+        
+        # 步骤2: Softmax计算概率（取绝对值）
+        abs_energies = np.array([abs(energy) for _, energy in node_energies])
+        exp_energies = np.exp(abs_energies / temperature)
+        probabilities = exp_energies / np.sum(exp_energies)
+        
+        # 步骤3: 按概率分配名额
+        allocations = np.floor(probabilities * total_slots).astype(int)
+        
+        # 处理剩余名额
+        remaining = total_slots - np.sum(allocations)
+        if remaining > 0:
+            fractional_parts = probabilities * total_slots - allocations
+            sorted_indices = np.argsort(fractional_parts)[::-1]
+            for i in range(remaining):
+                allocations[sorted_indices[i % len(sorted_indices)]] += 1
+        
+        # 构建返回字典
+        result = {}
+        for i, (node_key, _) in enumerate(node_energies):
+            result[node_key] = int(allocations[i])
+        
+        # 记录日志
+        try:
+            from mcts_logger import log_debug
+            log_debug("expansion", "Softmax分配完成", {
+                "total_slots": total_slots,
+                "temperature": temperature,
+                "allocations": result,
+                "probabilities": probabilities.tolist()
+            })
+        except ImportError:
+            pass
+        
+        return result
+    
+    def expand_node_with_allocated_slots(
+        self,
+        node: 'MCTSNode',
+        allocated_slots: int
+    ) -> Dict[str, 'MCTSNode']:
+        """
+        根据分配到的名额扩展节点（V2版本）
+        
+        使用EGNN批量预测所有可能的子节点，然后选择Top-k（k=allocated_slots）
+        绝不随机选择！
+        
+        Args:
+            node: 要扩展的节点
+            allocated_slots: 分配到的名额数（由Softmax分配）
+        
+        Returns:
+            新创建的子节点字典
+        """
+        if allocated_slots <= 0:
+            return {}
+        
+        # 获取当前决策层
+        level = node.state.decision_level
+        
+        if level == 1:
+            # 第一层：填充氨基酸
+            # 限制为allocated_slots，但不超过配置的最大值
+            max_exp = config.MCTS_CONFIG.get("max_expansions", 19)
+            actual_expansions = min(allocated_slots, max_exp)
+            return self.expand_level1_amino_acid(node, max_expansions=actual_expansions)
+        elif level == 2:
+            # 第二层：选择交联剂
+            return self.expand_level2_crosslinker(node, max_expansions=allocated_slots)
+        elif level == 3:
+            # 第三层：选择二硫键
+            return self.expand_level3_disulfide(node, max_expansions=allocated_slots)
+        else:
+            return {}
     
     def expand_level2_single(self, node: MCTSNode, crosslinker: Optional[str],
                             prior_prob: Optional[float] = None) -> MCTSNode:

@@ -17,6 +17,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 
+# 导入MCTS日志模块
+try:
+    from mcts_logger import get_logger, log_crosslinker_debug
+except ImportError:
+    get_logger = None
+    log_crosslinker_debug = None
+
 
 # 【修复】使用项目目录下的临时文件夹，避免硬编码 /tmp
 TEMP_DIR = config.BASE_DIR / "temp" / "ligand_generator"
@@ -248,8 +255,6 @@ def add_crosslinker(mol: 'Chem.Mol',
         print(f"【警告】找不到Cys的硫原子")
         return mol
     
-    print(f"【调试】找到 {len(cys_sulfur_indices)} 个Cys硫原子: {cys_sulfur_indices}")
-    
     # 根据cys_positions选择要连接的硫原子
     # cys_positions是序列位置，我们需要找到对应位置的Cys的硫原子
     selected_sulfur_indices = []
@@ -268,8 +273,6 @@ def add_crosslinker(mol: 'Chem.Mol',
         print(f"【警告】无法找到指定位置的Cys硫原子")
         return mol
     
-    print(f"【调试】选择的硫原子: {selected_sulfur_indices}")
-    
     # 合并分子
     combo = Chem.CombineMols(mol, xlinker_mol)
     editable = Chem.EditableMol(combo)
@@ -281,10 +284,9 @@ def add_crosslinker(mol: 'Chem.Mol',
         if atom.GetAtomicNum() == 35:  # Br
             br_indices.append(xlinker_start_idx + i)
     
-    print(f"【调试】交联剂溴原子: {br_indices}")
-    
     # 创建C-S键（Cys的S与交联剂的C，通过删除Br）
     bonds_created = 0
+    bond_details = []
     for i, s_idx in enumerate(selected_sulfur_indices[:len(br_indices)]):
         if i >= len(br_indices):
             break
@@ -317,14 +319,22 @@ def add_crosslinker(mol: 'Chem.Mol',
             editable.AddBond(adjusted_s_idx, adjusted_c_idx, Chem.BondType.SINGLE)
             bonds_created += 1
             
-            print(f"【调试】创建键: S({adjusted_s_idx}) - C({adjusted_c_idx})")
+            bond_details.append({"s": adjusted_s_idx, "c": adjusted_c_idx})
             
             # 更新后续Br的索引（因为删除了一个原子）
             for j in range(i + 1, len(br_indices)):
                 if br_indices[j] > br_idx:
                     br_indices[j] -= 1
     
-    print(f"【调试】创建了 {bonds_created} 个C-S键")
+    # 记录调试信息到日志（不打印到控制台）
+    if log_crosslinker_debug:
+        log_crosslinker_debug(
+            cys_sulfur_indices=cys_sulfur_indices,
+            selected_sulfur_indices=selected_sulfur_indices,
+            br_indices=br_indices,
+            bonds_created=bonds_created,
+            bond_details=bond_details
+        )
     
     result_mol = editable.GetMol()
     

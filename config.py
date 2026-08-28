@@ -116,7 +116,7 @@ TOOLS = {
 # - 大写字母：固定氨基酸（如 A, C, G）
 # - x：可变位置，由 MCTS 搜索确定
 # 环肽格式：ACX₆CX₆CG（16个氨基酸，3个固定Cys，使用TBMB交联剂形成单环）
-PEPTIDE_TEMPLATE = "ACxxxCxxxCG"
+PEPTIDE_TEMPLATE = "ACxxxxCxxxxCG"
 
 # 固定位置映射：{位置索引: 氨基酸}
 # 位置从0开始计数
@@ -124,9 +124,9 @@ PEPTIDE_TEMPLATE = "ACxxxCxxxCG"
 FIXED_POSITIONS = {
     0: "A",   # N端
     1: "C",   # 第一个半胱氨酸（TBMB连接位点1）
-    5: "C",   # 第二个半胱氨酸（TBMB连接位点2）
-    9: "C",  # C端
-    10: "G"
+    6: "C",   # 第二个半胱氨酸（TBMB连接位点2）
+    11: "C",  # C端
+    12: "G"
 }
 
 # 可变位置（模板中 'x' 的位置）
@@ -193,7 +193,7 @@ CROSSLINKER = "TBMB"
 # 交联剂连接位置（TBMB需要3个Cys）
 # ACX₆CX₆CG格式：Cys位于位置1, 8，第三个Cys需要在可变区域中指定
 # 这里配置前两个固定Cys的位置，第三个将在扩展时从可变区域选择
-CROSSLINKER_POSITIONS = [1, 5,9]  # 基础位置，第三个Cys在可变区域中确定
+CROSSLINKER_POSITIONS = [1,6,11]  # 基础位置，第三个Cys在可变区域中确定
 
 # =============================================================================
 # 分子量筛选范围（Da）
@@ -201,37 +201,74 @@ CROSSLINKER_POSITIONS = [1, 5,9]  # 基础位置，第三个Cys在可变区域�
 MOLECULAR_WEIGHT_RANGE = (800, 2000)
 
 # =============================================================================
-# MCTS 算法参数
+# 【新增】自适应MCTS-EGNN闭环优化配置（V2版本）
 # =============================================================================
-MCTS_ITERATIONS = 30000         # 默认迭代搜索次数
 
+# EGNN迭代轮次相关的动态函数
+# N: 当前EGNN迭代轮次（从1开始）
+
+def f_n(n: int) -> int:
+    """
+    选取母节点数量（随EGNN轮次递增）
+    第1轮: 19个，之后每轮+2，上限100
+    """
+    return min(19 + (n - 1) ** 2, 1000)
+
+def g_n(n: int) -> int:
+    """
+    每个母节点的随机填充数（随EGNN轮次递减）
+    第1轮: 50个，之后每轮-2，下限10
+    """
+    return max(50 - (n - 1) * 2, 10)
+
+def h_n(n: int) -> int:
+    """
+    Vina验证数量（随EGNN轮次递增）
+    第1轮: 40个，之后每轮+3，上限200
+    """
+    return min(40 + (n - 1) * 12, 300)
+
+# Softmax分配配置
+SOFTMAX_TEMPERATURE = 1.0       # Softmax温度参数
+MAX_EXPANSIONS_PER_NODE = 19    # 每个母节点最大扩展数（19种氨基酸）
+
+# 最大EGNN迭代轮数
+MAX_EGNN_ITERATIONS = 100
+CONVERGENCE_PATIENCE = 5        # 收敛判定耐心值（连续N轮无改善）
+
+# 保留旧配置（兼容性）
+MAX_RANDOM_FILL = 50            # 最大随机填充数（浅层）
+MIN_RANDOM_FILL = 10            # 最小随机填充数（深层）
+FILL_DECREMENT_PER_DEPTH = 2    # 每层深度减少的填充数
+INITIAL_VINA_BATCH = 40         # 初始Vina验证数量
+MIN_VINA_BATCH = 10             # 最小Vina验证数量（后期可减少）
+
+# 计算可变位置数（模板中'x'的数量）
+def _count_variable_positions(template: str = None) -> int:
+    """计算模板中可变位置的数量"""
+    if template is None:
+        template = PEPTIDE_TEMPLATE
+    return sum(1 for c in template if c in ['x', 'X'])
+
+VARIABLE_POSITIONS_COUNT = _count_variable_positions()
+
+# 派生参数（由基础参数计算）
+# 最大路径长度 = 可变位置数（需要填满的位置数）
+MAX_PATH_LENGTH = VARIABLE_POSITIONS_COUNT
+
+# MCTS配置（V2版本 - 自适应参数）
 MCTS_CONFIG = {
-    "n_iterations": MCTS_ITERATIONS,  # 使用统一的迭代次数
-    "c_puct": 1.414,            # PUCT 探索常数
+    "c_puct": 0.814,            # PUCT 探索常数
     "n_simulations": 10,        # 每次迭代模拟次数
     "esmif_top_k": 5,           # ESM-IF 压缩分支因子至 top-k
-    "max_expansions": 5,        # 每次扩展的最大子节点数
+    "max_expansions": 19,       # 每次扩展的最大子节点数（19种氨基酸，排除Cys）
     "use_egnn_prior": True,     # 是否使用EGNN作为扩展先验
-    "prior_temperature": 1.0,   # EGNN先验温度参数（越大越均匀，越小越锐化）
+    "prior_temperature": 1.0,   # EGNN先验温度参数
+    "softmax_temperature": 1.0, # Softmax分配温度
 }
 
 # =============================================================================
-# 多轮MCTS闭环优化配置
-# =============================================================================
-MULTI_ROUND_CONFIG = {
-    "n_rounds": 3,              # 默认轮数（MCTS-验证-重训循环次数）
-    "top_n_final": 20,          # 每轮最终验证的候选数量
-    "convergence_metric": "best",  # 收敛判定指标: best/mean/top3_mean/median
-    "min_improvement": 0.5,     # 最小改善阈值（kcal/mol）
-    "patience": 2,              # 收敛容忍轮数（连续N轮无改善则停止）
-    "window_size": 3,           # 收敛判定滑动窗口大小
-}
-
-# =============================================================================
-# EGNN + MCTS 闭环训练参数
-# =============================================================================
-# =============================================================================
-# EGNN + MCTS 闭环训练参数
+# EGNN训练配置
 # =============================================================================
 EGNN_CONFIG = {
     "hidden_dim": 128,          # EGNN 隐藏层维度
@@ -244,23 +281,20 @@ EGNN_CONFIG = {
 
 COLD_START_CONFIG = {
     "num_sequences": 10000,     # 冷启动生成的序列数量
-    "num_workers": 1,           # 并行工作进程数
+    "num_workers": 2,           # 并行工作进程数
 }
 
+# 保留ACTIVE_LEARNING_CONFIG但移除重复/冲突的参数
 ACTIVE_LEARNING_CONFIG = {
-    "mcts_iterations": 50000,   # 每轮 MCTS 探索迭代数
-    "top_n_candidates": 5000,   # 每轮选择的候选数量
     "min_new_data": 2000,       # 触发重新训练的最小新增数据量
     "min_new_ratio": 0.2,       # 触发重新训练的最小新增比例
-    "final_iterations": 100000, # 最终搜索的 MCTS 迭代数
-    "top_n_final": 500,          # 最终输出的候选数量
 }
 
 # =============================================================================
 # 并行 Vina 对接配置（极致内存节省版 - 针对OOM优化）
 # =============================================================================
 PARALLEL_VINA_CONFIG = {
-    "num_workers": 2,            # 降到2个并行任务（极致内存节省）
+    "num_workers": 3,            # 降到2个并行任务（极致内存节省）
     # 总CPU需求 = 2 * 8 = 16线程，远低于32线程上限
     # 确保不会OOM，牺牲速度换取稳定性
     "timeout": 3000,              # 每个分子对接超时时间（秒）
@@ -291,7 +325,18 @@ VINA_CONFIG = {
 }
 
 # 对接盒子默认尺寸（Å），实际从 fpocket 结果计算
-VINA_BOX_SIZE = (22, 22,  22)
+VINA_BOX_SIZE = (26, 26,  26)
+
+# =============================================================================
+# 多轮MCTS闭环优化配置
+# =============================================================================
+MULTI_ROUND_CONFIG = {
+    "patience": 2,              # 收敛容忍轮数
+    "min_improvement": 0.5,     # 最小改善阈值（kcal/mol）
+    "window_size": 3,           # 滑动窗口大小
+    "convergence_metric": "best",  # 收敛判定指标
+    "max_rounds": 3,            # 最大轮数
+}
 
 # =============================================================================
 # 氨基酸物理化学性质（用于启发式评分）
@@ -396,3 +441,23 @@ if __name__ == "__main__":
     print(f"模板长度: {len(PEPTIDE_TEMPLATE)}")
     print(f"可变位置数: {len(VARIABLE_POSITIONS)}")
     print(f"二硫键配对: {DISULFIDE_BONDS}")
+
+
+# =============================================================================
+# 自适应MCTS配置（新增）
+# =============================================================================
+try:
+    from adaptive_mcts_config import AdaptiveMCTSConfig
+    
+    ADAPTIVE_MCTS_CONFIG = {
+        "use_softmax_allocation": True,      # 使用Softmax分配扩展名额
+        "total_expansion_slots": 50,          # 总扩展名额
+        "softmax_temperature": 1.0,           # Softmax温度
+        "max_expansions_per_node": 5,         # 每节点最大扩展数
+        "split_ratio": (0.8, 0.1, 0.1),       # 训练:验证:测试
+        "convergence_patience": 5,            # 收敛容忍轮数
+        "convergence_min_improvement": 0.05,  # 最小改善阈值
+    }
+except ImportError:
+    # 如果adaptive_mcts_config不存在，使用默认配置
+    ADAPTIVE_MCTS_CONFIG = None

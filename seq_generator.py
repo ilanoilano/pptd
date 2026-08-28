@@ -57,15 +57,15 @@ def generate_full_sequence(partial_sequence: Optional[str] = None) -> str:
     return ''.join(seq_list)
 
 
-def generate_multiple_sequences(n_sequences: int, 
+def generate_multiple_sequences(n_sequences: int,
                                  partial_sequence: Optional[str] = None) -> List[str]:
     """
     生成多个随机序列
-    
+
     Args:
         n_sequences: 需要生成的序列数量
         partial_sequence: 部分序列模板（默认使用config模板）
-    
+
     Returns:
         序列列表
     """
@@ -73,6 +73,44 @@ def generate_multiple_sequences(n_sequences: int,
     for _ in range(n_sequences):
         seq = generate_full_sequence(partial_sequence)
         sequences.append(seq)
+    return sequences
+
+
+def generate_n_random_fills(partial_sequence: str, n: int) -> List[str]:
+    """
+    【新增】为部分序列生成N个不同的随机填充完整序列
+
+    这是新流程的核心函数：
+    - 保留已填充的氨基酸
+    - 对每个占位符独立随机选择氨基酸
+    - 生成N个不同的完整序列
+
+    Args:
+        partial_sequence: 部分序列（如 "AC_D_C___CG"）
+        n: 需要生成的序列数量
+
+    Returns:
+        N个不同的完整序列列表
+
+    示例：
+        Input:  "AC_D_C___CG", n=3
+        Output: ["ACADACDEFCG", "ACPDGCHQWCG", "ACRDVCMLKCG"]
+    """
+    if not partial_sequence:
+        raise ValueError("partial_sequence 不能为空")
+
+    sequences = []
+    attempts = 0
+    max_attempts = n * 10  # 防止无限循环
+
+    while len(sequences) < n and attempts < max_attempts:
+        attempts += 1
+        seq = generate_full_sequence(partial_sequence)
+
+        # 确保不重复
+        if seq not in sequences:
+            sequences.append(seq)
+
     return sequences
 
 
