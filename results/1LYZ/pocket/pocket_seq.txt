@@ -1,0 +1,9 @@
+>Pocket_4 Score=0.03 Volume=297.8
+A:6 CYS C
+A:7 GLU E
+A:10 ALA A
+A:126 GLY G
+A:127 CYS C
+A:128 ARG R
+
+Sequence: CEAGCR
