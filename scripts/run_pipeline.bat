@@ -1,103 +1,73 @@
 @echo off
 chcp 65001 >nul
-REM MCTS-Peptide 完整流程脚本 (Windows)
-REM 使用方式: run_pipeline.bat <target_name> [options]
-
-set "TARGET=1LYZ"
-set "COLD_START="
-set "N_SEQUENCES=100"
-set "MCTS_ITER=1000"
-set "MAX_ITER=50000"
-
-REM 解析参数
-:parse_args
-if "%~1"=="" goto :done_parsing
-if "%~1"=="--cold-start" (
-    set "COLD_START=--cold-start"
-    shift
-    goto :parse_args
-)
-if "%~1"=="--n-sequences" (
-    set "N_SEQUENCES=%~2"
-    shift
-    shift
-    goto :parse_args
-)
-if "%~1"=="--mcts-iter" (
-    set "MCTS_ITER=%~2"
-    shift
-    shift
-    goto :parse_args
-)
-if "%~1"=="--max-iter" (
-    set "MAX_ITER=%~2"
-    shift
-    shift
-    goto :parse_args
-)
-if "%~1"=="-h" goto :show_help
-if "%~1"=="--help" goto :show_help
-set "TARGET=%~1"
-shift
-goto :parse_args
-
-:show_help
-echo 用法: run_pipeline.bat ^<target_name^> [options]
-echo.
-echo 选项:
-echo   --cold-start          执行冷启动（首次运行）
-echo   --n-sequences N       冷启动序列数量（默认: 100）
-echo   --mcts-iter N         每次MCTS迭代数（默认: 1000）
-echo   --max-iter N          最大迭代数（默认: 50000）
-echo   -h, --help            显示此帮助
-echo.
-echo 示例:
-echo   run_pipeline.bat 1LYZ --cold-start --n-sequences 100
-echo   run_pipeline.bat 1LYZ --mcts-iter 5000 --max-iter 100000
-echo.
-echo 注意: 此脚本需要在 WSL 环境中运行
-echo   wsl ./run_pipeline.sh %*
-exit /b 0
-
-:done_parsing
 echo ========================================
-echo   MCTS-Peptide 完整流程
+echo MCTS 环肽设计流水线
 echo ========================================
+echo.
+
+REM 设置靶点名称（可修改）
+set TARGET=1LYZ
+
 echo 靶点: %TARGET%
 echo.
 
-REM 检查 WSL
-echo 检查 WSL...
-wsl --version >nul 2>&1
-if errorlevel 1 (
-    echo 错误: WSL 未安装或未启用
-    echo 请参考: https://docs.microsoft.com/zh-cn/windows/wsl/install
-    exit /b 1
+REM 检查是否已存在EGNN模型
+echo [检查] 检查EGNN模型状态...
+if exist "D:\code\AA\egnn\models\best_model.pt" (
+    echo      发现已有EGNN模型，将跳过冷启动
+    set SKIP_COLD_START=--no-resume
+) else (
+    echo      未找到EGNN模型，将执行冷启动
+    set SKIP_COLD_START=
 )
-echo [OK] WSL 已安装
 
 echo.
-echo 正在启动 WSL 执行流程...
+echo ========================================
+echo 阶段一: PDB预处理
+echo ========================================
 echo.
 
-REM 在 WSL 中执行 Bash 脚本
-wsl -e bash -c "cd /mnt/d/code/AA && ./run_pipeline.sh %TARGET% %COLD_START% --n-sequences %N_SEQUENCES% --mcts-iter %MCTS_ITER% --max-iter %MAX_ITER%"
+python run_phase1.py -t %TARGET% --pdb PDB\%TARGET%.pdb\pdb%TARGET%.ent
 
 if errorlevel 1 (
-    echo.
-    echo [错误] 流程执行失败
+    echo [错误] 阶段一执行失败！
+    pause
     exit /b 1
 )
 
 echo.
 echo ========================================
-echo   流程完成！
+echo 阶段二: MCTS搜索
+echo ========================================
+echo.
+
+REM 多轮MCTS闭环优化模式（推荐）
+echo 运行模式: 多轮MCTS闭环优化
+echo.
+
+python run_phase2.py -t %TARGET% ^
+    --n-rounds 3 ^
+    --n-sequences 50 ^
+    --mcts-iter 1000 ^
+    --max-iter 10000 ^
+    --top-n-final 20 ^
+    --val-interval 5000
+
+if errorlevel 1 (
+    echo [错误] 阶段二执行失败！
+    pause
+    exit /b 1
+)
+
+echo.
+echo ========================================
+echo 流水线执行完成！
 echo ========================================
 echo.
 echo 结果位置:
-echo   - 候选序列: results/%TARGET%/candidates.csv
-echo   - 数据集: results/%TARGET%/dataset.csv
-echo   - 检查点: checkpoints/%TARGET%/
-echo   - EGNN模型: egnn/models/best_model.pt
+echo   - 候选结果: D:\code\AA\results\%TARGET%\candidates.csv
+echo   - 数据集: D:\code\AA\results\%TARGET%\dataset.csv
+echo   - 日志: D:\code\AA\logs\
+echo   - 检查点: D:\code\AA\checkpoints\%TARGET%\
 echo.
 pause
