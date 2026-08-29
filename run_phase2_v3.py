@@ -23,6 +23,7 @@ import sys
 import json
 import time
 import random
+import subprocess
 import numpy as np
 import torch
 from pathlib import Path
@@ -115,18 +116,28 @@ class AdaptiveMCTSEngineV3:
     
     # =================================================================
     # 动态参数函数 f(N), g(N), h(N)
+    # 从 config 读取配置，确保修改 config 能生效
     # =================================================================
     
     def f_n(self, n: int) -> int:
         """选取母节点数量（随EGNN轮次递增）"""
+        # 优先使用 config.f_n，如果不存在则使用默认值
+        if hasattr(config, 'f_n') and callable(config.f_n):
+            return config.f_n(n)
         return min(19 + (n - 1) * 2, 100)
     
     def g_n(self, n: int) -> int:
         """每个母节点的随机填充数（随EGNN轮次递减）"""
+        # 优先使用 config.g_n，如果不存在则使用默认值
+        if hasattr(config, 'g_n') and callable(config.g_n):
+            return config.g_n(n)
         return max(50 - (n - 1) * 2, 10)
     
     def h_n(self, n: int) -> int:
         """Vina验证数量（随EGNN轮次递增）"""
+        # 优先使用 config.h_n，如果不存在则使用默认值
+        if hasattr(config, 'h_n') and callable(config.h_n):
+            return config.h_n(n)
         return min(40 + (n - 1) * 3, 200)
     
     # =================================================================
@@ -267,12 +278,24 @@ class AdaptiveMCTSEngineV3:
                             "binding_energy": result.binding_energy,
                             "progress": f"{i}/{len(sequences)}"
                         })
+                elif result.success:
+                    print(f"    【过滤】{seq}: 结合能={result.binding_energy:.2f} (>=0，被过滤)")
+                    
+                    # 记录Vina过滤日志
+                    if HAS_LOGGER:
+                        log_debug("vina", f"Vina对接结果过滤", {
+                            "sequence": seq,
+                            "reason": f"energy={result.binding_energy:.2f} >= 0",
+                            "progress": f"{i}/{len(sequences)}"
+                        })
                 else:
+                    print(f"    【失败】{seq}: Vina对接未成功")
+                    
                     # 记录Vina失败日志
                     if HAS_LOGGER:
                         log_debug("vina", f"Vina对接失败", {
                             "sequence": seq,
-                            "reason": "energy >= 0 or not success",
+                            "reason": "not success",
                             "progress": f"{i}/{len(sequences)}"
                         })
             except Exception as e:
@@ -331,8 +354,32 @@ class AdaptiveMCTSEngineV3:
                 for seq, energy in data:
                     writer.writerow([seq, energy])
             
-            # 调用训练脚本（egnn_23.py 不需要 --train 参数）
-            import subprocess
+            # 【修复】步骤1：先调用 EGNN_1.py 准备数据
+            print("  [1/2] 准备EGNN数据 (EGNN_1.py)...")
+            result_prep = subprocess.run(
+                [sys.executable, "EGNN_1.py", "-s", str(sequences_file), "-e", str(energies_file)],
+                cwd=config.BASE_DIR,
+                capture_output=True,
+                text=True,
+                timeout=3600
+            )
+            
+            if result_prep.returncode != 0:
+                print(f"  ✗ 数据准备失败: {result_prep.stderr}")
+                
+                # 记录数据准备失败日志
+                if HAS_LOGGER:
+                    log_debug("egnn_prep", f"EGNN数据准备失败", {
+                        "error": result_prep.stderr,
+                        "n_data": len(data)
+                    })
+                
+                return False
+            
+            print("  ✓ 数据准备完成")
+            
+            # 【修复】步骤2：再调用 EGNN_23.py 训练模型
+            print("  [2/2] 训练EGNN模型 (EGNN_23.py)...")
             result = subprocess.run(
                 [sys.executable, "egnn_23.py"],
                 cwd=config.BASE_DIR,
@@ -448,8 +495,8 @@ class AdaptiveMCTSEngineV3:
         
         # 步骤2: 评估每个母节点（g(N)个随机填充）
         print(f"\n[2/6] 评估母节点（每个{self.g_n(n)}个随机填充）...")
-        node_scores = self._evaluate_parent_nodes(parent_nodes, self.g_n(n))
-        print(f"  ✓ 评估完成")
+        node_scores, all_filled_sequences = self._evaluate_parent_nodes(parent_nodes, self.g_n(n))
+        print(f"  ✓ 评估完成，收集到 {len(all_filled_sequences)} 个随机填充的完整序列")
         
         # 步骤3: Softmax分配f(N+1)个名额
         next_n = n + 1
@@ -470,9 +517,9 @@ class AdaptiveMCTSEngineV3:
             if seq not in self.candidate_pool or score < self.candidate_pool[seq]:
                 self.candidate_pool[seq] = score
         
-        # 步骤5: 选Top-h(N)个终端节点Vina验证
-        print(f"\n[5/6] Vina验证Top-{self.h_n(n)}个候选...")
-        vina_results = self._select_and_validate_top_h(self.h_n(n))
+        # 步骤5: 选Top-h(N)个随机填充的完整序列进行Vina验证
+        print(f"\n[5/6] Vina验证Top-{self.h_n(n)}个随机填充序列...")
+        vina_results = self._select_and_validate_filled_sequences(all_filled_sequences, self.h_n(n))
         print(f"  ✓ Vina验证完成: {len(vina_results)}个")
         
         # 步骤6: 8:1:1划分，微调EGNN
@@ -539,7 +586,7 @@ class AdaptiveMCTSEngineV3:
         children = expansion_engine.expand_level1_amino_acid(root, max_expansions=n_nodes)
         return list(children.values())
     
-    def _evaluate_parent_nodes(self, nodes: List[MCTSNode], n_fills: int) -> Dict[str, float]:
+    def _evaluate_parent_nodes(self, nodes: List[MCTSNode], n_fills: int) -> Tuple[Dict[str, float], List[Tuple[str, float]]]:
         """
         评估每个母节点
         
@@ -549,9 +596,12 @@ class AdaptiveMCTSEngineV3:
         3. 计算平均亲和度
         
         Returns:
-            {node_key: avg_energy}
+            (node_scores, all_filled_sequences)
+            - node_scores: {node_key: avg_energy}
+            - all_filled_sequences: [(sequence, energy), ...] 所有随机填充的完整序列
         """
         node_scores = {}
+        all_filled_sequences = []  # 【新增】收集所有随机填充的完整序列
         
         for i, node in enumerate(nodes, 1):
             seq = node.state.sequence
@@ -567,6 +617,10 @@ class AdaptiveMCTSEngineV3:
             avg_energy = sum(energies) / len(energies) if energies else 0.0
             node_scores[node.state.to_key()] = avg_energy
             
+            # 【新增】收集所有随机填充的完整序列及其能量
+            for filled_seq, energy in zip(filled_sequences, energies):
+                all_filled_sequences.append((filled_seq, energy))
+            
             # 打印每个节点的EGNN测试平均值（包含统计信息）
             print(f"avg_energy={avg_energy:.2f}")
             if energies:
@@ -580,7 +634,6 @@ class AdaptiveMCTSEngineV3:
                     random_count=i * n_fills,
                     sequence=seq,
                     energy=avg_energy,
-                    max_iterations=config.MAX_EGNN_ITERATIONS
                 )
                 log_debug("mcts", f"母节点评估完成", {
                     "node_index": i,
@@ -593,7 +646,8 @@ class AdaptiveMCTSEngineV3:
                     "n_fills": n_fills
                 })
         
-        return node_scores
+        print(f"  ✓ 共生成 {len(all_filled_sequences)} 个随机填充的完整序列")
+        return node_scores, all_filled_sequences
     
     def _allocate_slots_with_softmax(self, node_scores: Dict[str, float], 
                                      total_slots: int) -> Dict[str, int]:
@@ -711,7 +765,13 @@ class AdaptiveMCTSEngineV3:
                 terminal_candidates[seq] = score
         
         if not terminal_candidates:
-            print("  警告: 没有未验证的终端节点")
+            print(f"  【警告】没有未验证的终端节点")
+            print(f"    候选池大小: {len(self.candidate_pool)}")
+            print(f"    已验证数量: {len(self.vina_validated)}")
+            # 打印候选池中的部分序列用于调试
+            if self.candidate_pool:
+                sample_seqs = list(self.candidate_pool.keys())[:3]
+                print(f"    候选池样本: {sample_seqs}")
             return []
         
         # 按EGNN评分排序（越低越好）
@@ -726,6 +786,54 @@ class AdaptiveMCTSEngineV3:
         # 运行Vina
         return self._run_vina_batch(sequences)
     
+    def _select_and_validate_filled_sequences(self, 
+                                               filled_sequences: List[Tuple[str, float]], 
+                                               n_validate: int) -> List[Tuple[str, float]]:
+        """
+        从随机填充的完整序列中选择Top-h(N)个进行Vina验证
+        
+        Args:
+            filled_sequences: [(sequence, egnn_energy), ...] 随机填充的完整序列
+            n_validate: 要验证的数量
+        
+        Returns:
+            [(sequence, vina_energy), ...] Vina验证结果
+        """
+        if not filled_sequences:
+            print("  【警告】没有随机填充的完整序列")
+            return []
+        
+        # 去重：同一序列保留EGNN预测能量最好的
+        unique_sequences = {}
+        for seq, energy in filled_sequences:
+            if seq not in unique_sequences or energy < unique_sequences[seq]:
+                unique_sequences[seq] = energy
+        
+        # 过滤掉已验证的序列
+        unvalidated = {seq: energy for seq, energy in unique_sequences.items() 
+                       if seq not in self.vina_validated}
+        
+        if not unvalidated:
+            print(f"  【警告】所有随机填充序列都已验证过")
+            print(f"    总序列数: {len(unique_sequences)}")
+            print(f"    已验证: {len(self.vina_validated)}")
+            return []
+        
+        # 按EGNN预测能量排序（越低越好）
+        sorted_sequences = sorted(unvalidated.items(), key=lambda x: x[1])
+        
+        # 选择Top-n_validate
+        to_validate = sorted_sequences[:n_validate]
+        sequences = [seq for seq, _ in to_validate]
+        
+        print(f"  从 {len(filled_sequences)} 个填充序列中")
+        print(f"  去重后: {len(unique_sequences)} 个")
+        print(f"  未验证: {len(unvalidated)} 个")
+        print(f"  选择Top-{len(sequences)}个进行Vina验证")
+        
+        # 运行Vina
+        return self._run_vina_batch(sequences)
+    
     def _update_egnn_with_new_data(self, vina_results: List[Tuple[str, float]]) -> bool:
         """
         使用新的Vina数据更新EGNN
@@ -736,8 +844,12 @@ class AdaptiveMCTSEngineV3:
         4. 评估测试集
         """
         if not vina_results:
-            print("  没有新数据，跳过更新")
-            return True
+            print("  【错误】Vina对接没有返回任何有效数据！")
+            print("  可能原因：")
+            print("    1. Vina对接全部失败")
+            print("    2. 所有对接结果的结合能 >= 0（被过滤）")
+            print("    3. 候选池中没有未验证的终端节点")
+            return False
         
         # 更新已验证集合
         for seq, energy in vina_results:

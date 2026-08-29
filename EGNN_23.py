@@ -376,15 +376,31 @@ def validate(model, val_loader, criterion):
 
 def main(data_dir: Optional[Path] = None,
          output_dir: Optional[Path] = None,
-         hidden_dim: int = 128,
-         num_layers: int = 4,
-         num_epochs: int = 100,
-         batch_size: int = 8,
-         lr: float = 1e-3,
-         patience: int = 10):
+         hidden_dim: int = None,
+         num_layers: int = None,
+         num_epochs: int = None,
+         batch_size: int = None,
+         lr: float = None,
+         patience: int = None):
     """
     主训练函数
+    
+    参数优先级：传入值 > config.EGNN_CONFIG > 默认值
     """
+    # 从config读取默认值（如果未传入）
+    if hidden_dim is None:
+        hidden_dim = config.EGNN_CONFIG.get("hidden_dim", 128)
+    if num_layers is None:
+        num_layers = config.EGNN_CONFIG.get("num_layers", 4)
+    if num_epochs is None:
+        num_epochs = config.EGNN_CONFIG.get("num_epochs", 100)
+    if batch_size is None:
+        batch_size = config.EGNN_CONFIG.get("batch_size", 8)
+    if lr is None:
+        lr = config.EGNN_CONFIG.get("learning_rate", 1e-3)
+    if patience is None:
+        patience = config.EGNN_CONFIG.get("patience", 3)
+    
     set_seed(42)
     
     # 路径
@@ -395,10 +411,8 @@ def main(data_dir: Optional[Path] = None,
     
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    print("="*60)
+
     print("EGNN训练")
-    print("="*60)
     print(f"隐藏维度: {hidden_dim}")
     print(f"层数: {num_layers}")
     print(f"批次大小: {batch_size}")
@@ -483,15 +497,23 @@ def main(data_dir: Optional[Path] = None,
 if __name__ == "__main__":
     import argparse
     
+    # 从config读取默认值
+    default_hidden_dim = config.EGNN_CONFIG.get("hidden_dim", 128)
+    default_num_layers = config.EGNN_CONFIG.get("num_layers", 4)
+    default_num_epochs = config.EGNN_CONFIG.get("num_epochs", 100)
+    default_batch_size = config.EGNN_CONFIG.get("batch_size", 8)
+    default_lr = config.EGNN_CONFIG.get("learning_rate", 1e-3)
+    default_patience = config.EGNN_CONFIG.get("patience", 10)
+    
     parser = argparse.ArgumentParser(description='EGNN训练')
     parser.add_argument('--data-dir', type=Path, default=None)
     parser.add_argument('--output-dir', type=Path, default=None)
-    parser.add_argument('--hidden-dim', type=int, default=128)
-    parser.add_argument('--num-layers', type=int, default=4)
-    parser.add_argument('--num-epochs', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=8)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--patience', type=int, default=10)
+    parser.add_argument('--hidden-dim', type=int, default=default_hidden_dim)
+    parser.add_argument('--num-layers', type=int, default=default_num_layers)
+    parser.add_argument('--num-epochs', type=int, default=default_num_epochs)
+    parser.add_argument('--batch-size', type=int, default=default_batch_size)
+    parser.add_argument('--lr', type=float, default=default_lr)
+    parser.add_argument('--patience', type=int, default=default_patience)
     
     args = parser.parse_args()
     
