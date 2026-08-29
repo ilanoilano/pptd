@@ -34,6 +34,9 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
 
+# 强制使用CPU，RTX 5060暂不支持CUDA
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
@@ -49,7 +52,7 @@ def set_seed(seed=42):
 
 
 # 设备配置
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device('cpu')  # 强制CPU，RTX 5060暂不支持
 print(f"使用设备: {DEVICE}")
 
 

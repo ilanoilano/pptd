@@ -26,6 +26,10 @@ import torch
 from pathlib import Path
 from typing import Optional, Tuple, List
 
+# 强制使用CPU，RTX 5060暂不支持CUDA
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
@@ -158,7 +162,7 @@ class EGNNPredictor:
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.model = None
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.device = torch.device('cpu')  # 强制CPU，RTX 5060暂不支持
         
         self._load_model()
     
