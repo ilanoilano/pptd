@@ -46,15 +46,15 @@ def get_pocket_pdb_path(target_name: str) -> Path:
 # =============================================================================
 
 # 肽序列模板
-PEPTIDE_TEMPLATE = "ACxxxxCxxxxCG"
+PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
 
 # 固定位置映射：{位置索引: 氨基酸}
 FIXED_POSITIONS = {
     0: "A",   # N端
     1: "C",   # 第一个半胱氨酸
-    6: "C",   # 第二个半胱氨酸
-    11: "C",   # 第三个半胱氨酸
-    12: "G"   # C端
+    8: "C",   # 第二个半胱氨酸
+    15: "C",   # 第三个半胱氨酸
+    16: "G"   # C端
 }
 
 # 可变位置（模板中 'x' 的位置）
@@ -86,7 +86,7 @@ VARIABLE_AMINO_ACIDS = {
 CROSSLINKER = "TBMB"
 
 # 交联剂连接位置（TBMB需要3个Cys）
-CROSSLINKER_POSITIONS = [1,6,11]
+CROSSLINKER_POSITIONS = [1,8,15]
 
 
 # =============================================================================
@@ -142,7 +142,7 @@ EGNN_CONFIG = {
     "hidden_dim": 128,          # EGNN 隐藏层维度
     "num_layers": 4,            # EGNN 层数
     "learning_rate": 1e-3,      # 学习率
-    "batch_size": 32,           # 批次大小
+    "batch_size": 4,           # 批次大小
     "num_epochs": 100,          # 训练轮数
     "patience": 3,              # 早停耐心值
 }
@@ -157,9 +157,20 @@ VINA_CONFIG = {
     "energy_range": 4,          # 能量范围（kcal/mol）
     "cpu": 8,                   # CPU核心数
 }
+# =============================================================================
+# Vina 对接验证配置
+# =============================================================================
+VINA_VALIDATION = {
+    "enable": True,              # 是否启用验证
+    "max_distance": 7.0,         # 质心到口袋最大距离 (Å)
+    "min_atoms": 30,             # 最小原子数
+    "max_atoms": 2000,            # 最大原子数
+    "min_energy": -15.0,         # 最小结合能
+    "max_energy": -3.0,          # 最大结合能
+}
 
 # 对接盒子默认尺寸（Å）
-VINA_BOX_SIZE = (26, 26, 26)
+VINA_BOX_SIZE = (20, 20,20)
 
 
 # =============================================================================

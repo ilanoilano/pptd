@@ -475,8 +475,15 @@ def rdkit_mol_to_pdbqt(mol: 'Chem.Mol', output_path: Path) -> Path:
     pdbqt_lines.append("ROOT")
     
     # 写入原子
-    for i, atom in enumerate(atoms):
-        pos = conf.GetAtomPosition(i)
+    # 写入原子（跳过氢原子，Vina使用非极性氢）
+    atom_idx = 0
+    for atom in atoms:
+        # 跳过氢原子（原子序数=1）
+        if atom.GetAtomicNum() == 1:
+            continue
+        
+        atom_idx += 1
+        pos = conf.GetAtomPosition(atom.GetIdx())
         
         # 获取原子类型
         atomic_num = atom.GetAtomicNum()
@@ -492,7 +499,7 @@ def rdkit_mol_to_pdbqt(mol: 'Chem.Mol', output_path: Path) -> Path:
         atom_name = atom.GetSymbol()
         
         # PDBQT格式: ATOM 序号 名称 残基 链 残基序号 x y z 占据 温度因子 电荷 类型
-        line = f"ATOM  {i+1:5d}  {atom_name:3s} UNK A   1    {pos.x:8.3f}{pos.y:8.3f}{pos.z:8.3f}  1.00  0.00    {charge:+.3f} {atom_type:2s}"
+        line = f"ATOM  {atom_idx:5d}  {atom_name:3s} UNK A   1    {pos.x:8.3f}{pos.y:8.3f}{pos.z:8.3f}  1.00  0.00    {charge:+.3f} {atom_type:2s}"
         pdbqt_lines.append(line)
     
     pdbqt_lines.append("ENDROOT")

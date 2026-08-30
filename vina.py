@@ -9,6 +9,7 @@ Vina对接集成模块 (vina.py)
 支持：
 1. 实时对接进度输出（使用Popen实时读取）
 2. 多核CPU并行（单进程多核 + 多进程并行）
+3. 【新增】对接结果验证（配体质心位置 + 原子数检查）
 
 输入：
 - sequence: 完整氨基酸序列
@@ -27,6 +28,8 @@ import subprocess
 import tempfile
 import threading
 import queue
+import json
+import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 from dataclasses import dataclass
@@ -36,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import config
 from ligand_generator import generate_ligand
-
+from config import VINA_VALIDATION
 
 @dataclass
 class VinaResult:
@@ -46,6 +49,161 @@ class VinaResult:
     success: bool = True
     error_message: str = ""
     sequence: str = ""  # 添加序列信息
+    validation_passed: bool = True  # 新增：验证是否通过
+    validation_reason: str = ""  # 新增：验证失败原因
+
+
+def get_pocket_center(target_name: str) -> Optional[np.ndarray]:
+    """
+    从Vina配置文件中读取口袋中心坐标
+    
+    Args:
+        target_name: 靶点名称
+    
+    Returns:
+        口袋中心坐标 (x, y, z) 或 None（如果读取失败）
+    """
+    # 从 config 读取默认值
+    if min_atoms is None:
+        min_atoms = VINA_VALIDATION.get("min_atoms", 30)
+    if max_atoms is None:
+        max_atoms = VINA_VALIDATION.get("max_atoms", 150)
+    if max_distance is None:
+        max_distance = VINA_VALIDATION.get("max_distance", 5.0)
+    
+    try:
+        dirs = config.get_target_dirs(target_name)
+        vina_config = dirs["vina"] / "vina_config.txt"
+        
+        if not vina_config.exists():
+            print(f"【警告】Vina配置文件不存在: {vina_config}")
+            return None
+        
+        center = {}
+        with open(vina_config, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('center_x'):
+                    center['x'] = float(line.split('=')[1].strip())
+                elif line.startswith('center_y'):
+                    center['y'] = float(line.split('=')[1].strip())
+                elif line.startswith('center_z'):
+                    center['z'] = float(line.split('=')[1].strip())
+        
+        if 'x' in center and 'y' in center and 'z' in center:
+            return np.array([center['x'], center['y'], center['z']])
+        else:
+            print(f"【警告】无法从配置中读取完整的口袋中心坐标")
+            return None
+            
+    except Exception as e:
+        print(f"【警告】读取口袋中心失败: {e}")
+        return None
+
+
+def validate_docking_result(ligand_pdbqt: Path, 
+                            pocket_center: np.ndarray,
+                            binding_energy: float,
+                            min_atoms: int = None,
+                            max_atoms: int = None,
+                            max_distance: float = None) -> Tuple[bool, str]:
+    """
+    验证Vina对接结果
+    
+    检查项：
+    1. 配体质心是否在口袋内（距离口袋中心 < max_distance Å）
+    2. 配体原子数是否在合理范围内（min_atoms - max_atoms）
+    
+    Args:
+        ligand_pdbqt: 配体PDBQT文件路径
+        pocket_center: 口袋中心坐标 (x, y, z)
+        binding_energy: 结合能（用于日志记录）
+        min_atoms: 最小原子数（默认30）
+        max_atoms: 最大原子数（默认150）
+        max_distance: 质心到口袋中心的最大允许距离（默认5.0 Å）
+    
+    Returns:
+        (is_valid, reason): 
+        - is_valid: 验证是否通过
+        - reason: 失败原因（如果验证失败）
+    """
+    # 从 config 读取默认值
+    if min_atoms is None:
+        min_atoms = VINA_VALIDATION.get("min_atoms", 30)
+    if max_atoms is None:
+        max_atoms = VINA_VALIDATION.get("max_atoms", 150)
+    if max_distance is None:
+        max_distance = VINA_VALIDATION.get("max_distance", 5.0)
+    
+    try:
+        ligand_pdbqt = Path(ligand_pdbqt)
+        
+        if not ligand_pdbqt.exists():
+            return False, f"配体文件不存在: {ligand_pdbqt}"
+        
+        # 读取PDBQT文件，提取第一个 MODEL 的ATOM坐标
+        # Vina输出多个构象（MODEL 1, MODEL 2...），只验证第一个（最佳构象）
+        atoms = []
+        in_model = True  # 如果没有 MODEL 标记，默认读取所有
+        model_count = 0
+        
+        with open(ligand_pdbqt, 'r') as f:
+            for line in f:
+                # 检测 MODEL 标记
+                if line.startswith('MODEL'):
+                    model_count += 1
+                    if model_count == 1:
+                        in_model = True
+                    else:
+                        in_model = False  # 跳过后续 MODEL
+                    continue
+                
+                if line.startswith('ENDMDL'):
+                    in_model = False
+                    continue
+                
+                # 只读取第一个 MODEL 中的原子
+                if in_model and (line.startswith('ATOM') or line.startswith('HETATM')):
+                    # PDBQT格式: 
+                    # ATOM/HETATM 序号 原子名 残基名 链 残基号 x y z 占据 温度因子 电荷 类型
+                    try:
+                        x = float(line[30:38].strip())
+                        y = float(line[38:46].strip())
+                        z = float(line[46:54].strip())
+                        atoms.append([x, y, z])
+                    except (ValueError, IndexError):
+                        continue
+        
+        if len(atoms) == 0:
+            return False, "无法从PDBQT文件中提取原子坐标"
+        
+        # 检查原子数
+        n_atoms = len(atoms)
+        if n_atoms < min_atoms:
+            return False, f"原子数过少: {n_atoms} < {min_atoms}"
+        if n_atoms > max_atoms:
+            return False, f"原子数过多: {n_atoms} > {max_atoms}"
+        
+        # 计算质心
+        coords = np.array(atoms)
+        centroid = np.mean(coords, axis=0)
+        
+        # 检查口袋中心
+        if pocket_center is None:
+            # 如果无法获取口袋中心，跳过位置验证，只检查原子数
+            return True, ""
+        
+        # 计算质心到口袋中心的距离
+        distance = np.linalg.norm(centroid - pocket_center)
+        
+        if distance > max_distance:
+            return False, f"配体质心偏离口袋: 距离={distance:.2f}Å > {max_distance}Å (质心: {centroid[0]:.2f}, {centroid[1]:.2f}, {centroid[2]:.2f}, 口袋中心: {pocket_center[0]:.2f}, {pocket_center[1]:.2f}, {pocket_center[2]:.2f})"
+        
+        # 所有检查通过
+        return True, ""
+        
+    except Exception as e:
+        return False, f"验证过程异常: {e}"
 
 
 def get_vina_paths(target_name: str) -> Dict[str, Path]:
@@ -113,11 +271,14 @@ def run_vina_with_progress(ligand_pdbqt: Path,
                            num_modes: Optional[int] = None,
                            energy_range: Optional[int] = None,
                            verbose: bool = True,
-                           sequence: str = "") -> VinaResult:
+                           sequence: str = "",
+                           pocket_center: Optional[np.ndarray] = None,
+                           validate_docking: bool = None) -> VinaResult:
     """
     运行Vina对接，实时输出进度
     
     【修复】所有参数默认从 config.VINA_CONFIG 读取
+    【新增】支持对接结果验证
     
     Args:
         ligand_pdbqt: 配体PDBQT路径
@@ -131,10 +292,16 @@ def run_vina_with_progress(ligand_pdbqt: Path,
         energy_range: 能量范围（默认从config读取）
         verbose: 是否打印详细输出
         sequence: 序列信息（用于日志）
+        pocket_center: 口袋中心坐标（用于验证，可选）
+        validate_docking: 是否启用对接结果验证（默认True）
     
     Returns:
         VinaResult
     """
+    # 从 config 读取默认值
+    if validate_docking is None:
+        validate_docking = VINA_VALIDATION.get("enable", True)
+    
     ligand_pdbqt = Path(ligand_pdbqt)
     receptor_pdbqt = Path(receptor_pdbqt)
     vina_config = Path(vina_config)
@@ -360,11 +527,68 @@ def run_vina_with_progress(ligand_pdbqt: Path,
             return VinaResult(binding_energy, output_pdbqt, False, 
                             f"正值结合能 ({binding_energy:.2f})，对接失败", sequence)
         
+        # 【新增】对接结果验证
+        if validate_docking and output_pdbqt.exists():
+            if verbose:
+                seq_info = f"[{sequence}] " if sequence else ""
+                print(f"{seq_info}验证对接结果...")
+            
+            is_valid, validation_reason = validate_docking_result(
+                ligand_pdbqt=output_pdbqt,
+                pocket_center=pocket_center,
+                binding_energy=binding_energy
+            )
+            
+            if verbose:
+                if is_valid:
+                    print(f"{seq_info}✓ 验证通过: 质心距离口袋中心在允许范围内")
+                else:
+                    print(f"{seq_info}✗ 验证失败: {validation_reason}")
+            
+            if not is_valid:
+                print(f"\n{'='*60}")
+                print(f"【Vina验证失败】对接结果未通过验证")
+                print(f"{'='*60}")
+                print(f"  序列: {sequence}")
+                print(f"  结合能: {binding_energy:.2f} kcal/mol")
+                print(f"  失败原因: {validation_reason}")
+                print(f"\n  可能原因:")
+                print(f"    1. 配体未正确放置在口袋内（假阳性）")
+                print(f"    2. 配体结构异常（原子数不合理）")
+                print(f"    3. Vina搜索空间设置不当")
+                print(f"\n  解决方案:")
+                print(f"    1. 检查Vina配置文件的口袋中心坐标")
+                print(f"    2. 增大搜索盒子大小")
+                print(f"    3. 增加exhaustiveness参数")
+                print(f"{'='*60}\n")
+                
+                return VinaResult(
+                    binding_energy=binding_energy,
+                    output_file=output_pdbqt,
+                    success=False,
+                    error_message=f"对接验证失败: {validation_reason}",
+                    sequence=sequence,
+                    validation_passed=False,
+                    validation_reason=validation_reason
+                )
+            
+            if verbose:
+                seq_info = f"[{sequence}] " if sequence else ""
+                print(f"{seq_info}✓ 验证通过")
+        
         if verbose:
             seq_info = f"[{sequence}] " if sequence else ""
             print(f"{seq_info}✓ 结合能: {binding_energy:.4f} kcal/mol")
         
-        return VinaResult(binding_energy, output_pdbqt, True, "", sequence)
+        return VinaResult(
+            binding_energy=binding_energy,
+            output_file=output_pdbqt,
+            success=True,
+            error_message="",
+            sequence=sequence,
+            validation_passed=True,
+            validation_reason=""
+        )
         
     except subprocess.TimeoutExpired:
         if proc is not None:
@@ -426,11 +650,13 @@ def vina_dock(sequence: str,
               timeout: int = 300,
               n_cpu: Optional[int] = None,
               exhaustiveness: Optional[int] = None,
-              verbose: bool = False) -> float:
+              verbose: bool = False,
+              validate_docking: bool = None) -> float:
     """
     主函数：序列 → Vina结合能
     
     【修复】所有参数默认从 config 读取
+    【新增】支持对接结果验证
     
     Args:
         sequence: 完整氨基酸序列
@@ -442,6 +668,7 @@ def vina_dock(sequence: str,
         n_cpu: 使用的CPU核心数（默认从config读取）
         exhaustiveness: 搜索详尽度（默认从config读取）
         verbose: 是否打印详细信息
+        validate_docking: 是否启用对接结果验证（默认True）
     
     Returns:
         结合能（kcal/mol），失败时返回0
@@ -468,9 +695,20 @@ def vina_dock(sequence: str,
     if verbose:
         print(f"  配置: CPU={n_cpu}, exhaustiveness={exhaustiveness}")
     
+    # 从 config 读取验证默认值
+    if validate_docking is None:
+        validate_docking = VINA_VALIDATION.get("enable", True)
+    
     try:
         # 1. 获取Vina路径
         vina_paths = get_vina_paths(target_name)
+        
+        # 【新增】获取口袋中心坐标（用于验证）
+        pocket_center = None
+        if validate_docking:
+            pocket_center = get_pocket_center(target_name)
+            if pocket_center is not None and verbose:
+                print(f"  口袋中心: ({pocket_center[0]:.3f}, {pocket_center[1]:.3f}, {pocket_center[2]:.3f})")
         
         # 2. 生成分子（ligand_generator = sim_2 + sim_3）
         if verbose:
@@ -498,7 +736,9 @@ def vina_dock(sequence: str,
             n_cpu=n_cpu,
             exhaustiveness=exhaustiveness,
             verbose=verbose,
-            sequence=sequence
+            sequence=sequence,
+            pocket_center=pocket_center,
+            validate_docking=validate_docking
         )
         
         if not result.success:
@@ -523,12 +763,12 @@ def dock_single_worker(args):
     单进程工作函数（用于多进程并行）
     
     Args:
-        args: (sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness)
+        args: (sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness, validate_docking)
     
     Returns:
         (sequence, energy)
     """
-    sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness = args
+    sequence, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu, exhaustiveness, validate_docking = args
     
     energy = vina_dock(
         sequence=sequence,
@@ -539,7 +779,8 @@ def dock_single_worker(args):
         timeout=timeout,
         n_cpu=n_cpu,
         exhaustiveness=exhaustiveness,
-        verbose=True  # 每个进程都输出进度
+        verbose=True,  # 每个进程都输出进度
+        validate_docking=validate_docking
     )
     
     return sequence, energy
@@ -551,11 +792,13 @@ def batch_vina_dock_parallel(sequences: List[str],
                              n_workers: Optional[int] = None,
                              n_cpu_per_worker: Optional[int] = None,
                              timeout: int = 300,
-                             verbose: bool = True) -> Dict[str, float]:
+                             verbose: bool = True,
+                             validate_docking: bool = None) -> Dict[str, float]:
     """
     批量对接多个序列（多进程并行）
     
     【修复】所有参数默认从 config 读取
+    【新增】支持对接结果验证
     
     Args:
         sequences: 序列列表
@@ -565,6 +808,7 @@ def batch_vina_dock_parallel(sequences: List[str],
         n_cpu_per_worker: 每个Vina进程使用的CPU数（默认从config读取）
         timeout: 每个分子对接超时时间（秒）
         verbose: 是否打印详细信息
+        validate_docking: 是否启用对接结果验证（默认True）
     
     Returns:
         {序列: 结合能} 字典
@@ -572,6 +816,9 @@ def batch_vina_dock_parallel(sequences: List[str],
     import multiprocessing
     
     # 【修复】从 config 读取默认值
+    if validate_docking is None:
+        validate_docking = VINA_VALIDATION.get("enable", True)
+    
     if n_workers is None:
         n_workers = config.PARALLEL_VINA_CONFIG.get("num_workers", multiprocessing.cpu_count())
     if n_cpu_per_worker is None:
@@ -586,6 +833,7 @@ def batch_vina_dock_parallel(sequences: List[str],
     print(f"并行进程数: {n_workers}")
     print(f"每进程CPU数: {n_cpu_per_worker}")
     print(f"总CPU使用: {n_workers * n_cpu_per_worker}")
+    print(f"对接验证: {'启用' if validate_docking else '禁用'}")
     print("="*60)
     
     # 准备参数
@@ -596,7 +844,7 @@ def batch_vina_dock_parallel(sequences: List[str],
     output_dir.mkdir(parents=True, exist_ok=True)
     
     args_list = [
-        (seq, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu_per_worker, exhaustiveness)
+        (seq, target_name, crosslinker, crosslinker_positions, output_dir, timeout, n_cpu_per_worker, exhaustiveness, validate_docking)
         for seq in sequences
     ]
     
@@ -652,11 +900,13 @@ def batch_vina_dock(sequences: List[str],
                     n_workers: Optional[int] = None,
                     n_cpu_per_worker: Optional[int] = None,
                     timeout: int = 300,
-                    verbose: bool = False) -> Dict[str, float]:
+                    verbose: bool = False,
+                    validate_docking: bool = None) -> Dict[str, float]:
     """
     批量对接（支持串行和并行模式）
     
     【修复】所有参数默认从 config 读取
+    【新增】支持对接结果验证
     
     Args:
         sequences: 序列列表
@@ -667,6 +917,7 @@ def batch_vina_dock(sequences: List[str],
         n_cpu_per_worker: 每个Vina进程使用的CPU数
         timeout: 超时时间
         verbose: 是否打印详细信息
+        validate_docking: 是否启用对接结果验证（默认True）
     
     Returns:
         {序列: 结合能} 字典
@@ -674,7 +925,7 @@ def batch_vina_dock(sequences: List[str],
     if parallel:
         return batch_vina_dock_parallel(
             sequences, target_name, output_file,
-            n_workers, n_cpu_per_worker, timeout, verbose
+            n_workers, n_cpu_per_worker, timeout, verbose, validate_docking
         )
     else:
         # 串行模式
@@ -683,7 +934,7 @@ def batch_vina_dock(sequences: List[str],
             if verbose:
                 print(f"\n[{i+1}/{len(sequences)}] 处理序列: {seq}")
             
-            energy = vina_dock(seq, target_name, verbose=verbose)
+            energy = vina_dock(seq, target_name, verbose=verbose, validate_docking=validate_docking)
             results[seq] = energy
         
         if output_file:
@@ -730,10 +981,14 @@ def main():
                        help='使用并行模式')
     parser.add_argument('--workers', type=int, default=None,
                        help='并行工作进程数')
+    parser.add_argument('--no-validate', action='store_true',
+                       help='禁用对接结果验证')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='详细输出')
     
     args = parser.parse_args()
+    
+    validate_docking = not args.no_validate
     
     if args.sequence:
         # 单分子模式
@@ -744,7 +999,8 @@ def main():
             timeout=args.timeout,
             n_cpu=args.cpu,
             exhaustiveness=args.exhaustiveness,
-            verbose=args.verbose
+            verbose=args.verbose,
+            validate_docking=validate_docking
         )
         print(f"\n结合能: {energy:.4f} kcal/mol")
     
@@ -766,7 +1022,8 @@ def main():
             n_workers=args.workers,
             n_cpu_per_worker=args.cpu,
             timeout=args.timeout,
-            verbose=args.verbose
+            verbose=args.verbose,
+            validate_docking=validate_docking
         )
         
         # 打印统计

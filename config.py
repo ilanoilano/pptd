@@ -116,7 +116,7 @@ TOOLS = {
 # - 大写字母：固定氨基酸（如 A, C, G）
 # - x：可变位置，由 MCTS 搜索确定
 # 环肽格式：ACX₆CX₆CG（16个氨基酸，3个固定Cys，使用TBMB交联剂形成单环）
-PEPTIDE_TEMPLATE = "ACxxxxCxxxxCG"
+PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
 
 # 固定位置映射：{位置索引: 氨基酸}
 # 位置从0开始计数
@@ -124,9 +124,9 @@ PEPTIDE_TEMPLATE = "ACxxxxCxxxxCG"
 FIXED_POSITIONS = {
     0: "A",   # N端
     1: "C",   # 第一个半胱氨酸（TBMB连接位点1）
-    6: "C",   # 第二个半胱氨酸（TBMB连接位点2）
-    11: "C",  # C端
-    12: "G"
+    8: "C",   # 第二个半胱氨酸（TBMB连接位点2）
+    15: "C",  # C端
+    16: "G"
 }
 
 # 可变位置（模板中 'x' 的位置）
@@ -193,7 +193,7 @@ CROSSLINKER = "TBMB"
 # 交联剂连接位置（TBMB需要3个Cys）
 # ACX₆CX₆CG格式：Cys位于位置1, 8，第三个Cys需要在可变区域中指定
 # 这里配置前两个固定Cys的位置，第三个将在扩展时从可变区域选择
-CROSSLINKER_POSITIONS = [1,6,11]  # 基础位置，第三个Cys在可变区域中确定
+CROSSLINKER_POSITIONS = [1,8,15]  # 基础位置，第三个Cys在可变区域中确定
 
 # =============================================================================
 # 分子量筛选范围（Da）
@@ -212,7 +212,7 @@ def f_n(n: int) -> int:
     选取母节点数量（随EGNN轮次递增）
     第1轮: 19个，之后每轮+2，上限100
     """
-    return min(19 + (n - 1) ** 2, 1000)
+    return min(19 + (2*n - 1) ** 2, 1000)
 
 def g_n(n: int) -> int:
     """
@@ -226,7 +226,7 @@ def h_n(n: int) -> int:
     Vina验证数量（随EGNN轮次递增）
     第1轮: 40个，之后每轮+3，上限200
     """
-    return min(40 + (n - 1) * 12, 300)
+    return min(80 + (n - 1) * 12, 500)
 
 # Softmax分配配置
 SOFTMAX_TEMPERATURE = 1.0       # Softmax温度参数
@@ -276,7 +276,7 @@ EGNN_CONFIG = {
     "learning_rate": 1e-3,      # 学习率
     "batch_size": 32,           # 批次大小
     "num_epochs": 100,          # 训练轮数
-    "patience": 5,              # 早停耐心值
+    "patience": 3,              # 早停耐心值
 }
 
 COLD_START_CONFIG = {
@@ -294,7 +294,7 @@ ACTIVE_LEARNING_CONFIG = {
 # 并行 Vina 对接配置（极致内存节省版 - 针对OOM优化）
 # =============================================================================
 PARALLEL_VINA_CONFIG = {
-    "num_workers": 3,            # 降到2个并行任务（极致内存节省）
+    "num_workers": 2,            # 降到2个并行任务（极致内存节省）
     # 总CPU需求 = 2 * 8 = 16线程，远低于32线程上限
     # 确保不会OOM，牺牲速度换取稳定性
     "timeout": 3000,              # 每个分子对接超时时间（秒）
@@ -324,8 +324,17 @@ VINA_CONFIG = {
     "cpu": 8,                   # 降到8核（极致内存节省）
 }
 
+VINA_VALIDATION = {
+    "enable": True,              # 是否启用验证
+    "max_distance": 7.0,         # 质心到口袋最大距离 (Å)
+    "min_atoms": 30,             # 最小原子数
+    "max_atoms": 2000,            # 最大原子数
+    "min_energy": -15.0,         # 最小结合能
+    "max_energy": -3.0,          # 最大结合能
+}
+
 # 对接盒子默认尺寸（Å），实际从 fpocket 结果计算
-VINA_BOX_SIZE = (26, 26,  26)
+VINA_BOX_SIZE = (20,20,20)
 
 # =============================================================================
 # 多轮MCTS闭环优化配置
