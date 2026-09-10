@@ -4,26 +4,8 @@
 EGNN数据准备模块 (EGNN_1.py)
 功能：序列 + Vina分数 → 原子特征 + 坐标 → 划分数据集
 
-输入：
-- sequences.txt: 序列文件（每行一个序列）
-- energies.csv: Vina结合能数据（sequence,energy）
-
-处理逻辑：
-1. 读取序列和对应Vina分数
-2. 对每个序列，用RDKit生成3D构象（施加交联剂约束）
-3. 提取原子特征（元素类型、杂化方式、电荷等）
-4. 提取原子坐标（x, y, z）
-5. 按8:1:1划分训练/验证/测试集
-
-输出：
-- egnn/raw/train_data.npz
-- egnn/raw/val_data.npz
-- egnn/raw/test_data.npz
-
-每个样本包含：
-- features: 原子特征矩阵 (n_atoms, n_features)
-- coords: 原子坐标矩阵 (n_atoms, 3)
-- energy: Vina结合能标量
+【改进】增量处理：已处理序列记录在 processed_sequences.txt，不删除源文件
+支持断点续跑，反复运行不重复处理
 """
 
 import os
@@ -31,17 +13,15 @@ import sys
 import random
 import numpy as np
 from pathlib import Path
-from typing import List, Tuple, Dict, Optional
-from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional, Set
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 import config
-from ligand_generator import build_peptide_with_rdkit, generate_3d_conformation
-
+from ligand_generator import build_peptide_with_rdkit, generate_3d_conformation, add_crosslinker
 
 # 原子特征维度定义
-N_FEATURES = 20  # 总特征维度
+N_FEATURES = 20
 
 # 元素类型 one-hot (10维)
 ELEMENTS = ['C', 'N', 'O', 'S', 'P', 'F', 'Cl', 'Br', 'I', 'other']
@@ -52,49 +32,138 @@ HYBRIDIZATIONS = ['SP', 'SP2', 'SP3', 'other']
 HYBRID_TO_IDX = {h: i for i, h in enumerate(HYBRIDIZATIONS)}
 
 
-@dataclass
-class AtomFeatures:
-    """原子特征"""
-    element: str
-    hybridization: str
-    formal_charge: float
-    is_hbd: bool  # 氢键供体
-    is_hba: bool  # 氢键受体
-    is_aromatic: bool
-    degree: int
+# =============================================================================
+# 已处理序列记录管理
+# =============================================================================
 
+def load_processed_set(processed_file: Path) -> Set[str]:
+    """加载已处理序列集合"""
+    processed_file = Path(processed_file)
+    if not processed_file.exists():
+        return set()
+
+    with open(processed_file, 'r') as f:
+        return set(line.strip() for line in f if line.strip())
+
+
+def save_processed_set(processed_file: Path, seq_set: Set[str]):
+    """保存已处理序列集合"""
+    processed_file = Path(processed_file)
+    processed_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(processed_file, 'w') as f:
+        for seq in sorted(seq_set):
+            f.write(f"{seq}\n")
+
+
+def append_processed(processed_file: Path, sequences: List[str]):
+    """追加已处理序列到文件（不覆盖已有记录）"""
+    processed_file = Path(processed_file)
+    processed_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 读取已有记录
+    existing = set()
+    if processed_file.exists():
+        with open(processed_file, 'r') as f:
+            existing = set(line.strip() for line in f if line.strip())
+
+    # 追加新序列
+    new_seqs = [seq for seq in sequences if seq not in existing]
+    if new_seqs:
+        with open(processed_file, 'a') as f:
+            for seq in new_seqs:
+                f.write(f"{seq}\n")
+
+
+# =============================================================================
+# 缓存管理（累积保存，不覆盖）
+# =============================================================================
+
+def load_cache(cache_file: Path) -> Tuple[List, List, List, Set]:
+    """
+    加载缓存数据
+
+    Returns:
+        (features_list, coords_list, energies, sequences_set)
+    """
+    cache_file = Path(cache_file)
+    if not cache_file.exists():
+        return [], [], [], set()
+
+    data = np.load(cache_file, allow_pickle=True)
+    features_list = list(data['features']) if 'features' in data else []
+    coords_list = list(data['coords']) if 'coords' in data else []
+    energies = list(data['energies']) if 'energies' in data else []
+    sequences = set(data['sequences']) if 'sequences' in data else set()
+
+    print(f"  【缓存】加载 {len(energies)} 个已处理样本")
+    return features_list, coords_list, energies, sequences
+
+
+def save_cache(cache_file: Path, features_list: List, coords_list: List,
+               energies: List, sequences: Set):
+    """保存缓存数据（完全覆盖，保持一致性）"""
+    cache_file = Path(cache_file)
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # 转换为列表以保证可序列化
+    seq_list = list(sequences)
+
+    np.savez_compressed(
+        cache_file,
+        features=np.array(features_list, dtype=object),
+        coords=np.array(coords_list, dtype=object),
+        energies=np.array(energies),
+        sequences=np.array(seq_list, dtype=object)
+    )
+
+
+def append_to_cache(cache_file: Path, features: np.ndarray, coords: np.ndarray,
+                    energy: float, sequence: str):
+    """
+    追加单个样本到缓存（原子操作，避免数据丢失）
+    """
+    cache_file = Path(cache_file)
+
+    # 加载已有数据
+    features_list, coords_list, energies, seq_set = load_cache(cache_file)
+
+    # 检查是否已存在
+    if sequence in seq_set:
+        return False
+
+    # 追加新数据
+    features_list.append(features)
+    coords_list.append(coords)
+    energies.append(energy)
+    seq_set.add(sequence)
+
+    # 保存
+    save_cache(cache_file, features_list, coords_list, energies, seq_set)
+    return True
+
+
+# =============================================================================
+# 核心处理函数
+# =============================================================================
 
 def extract_atom_features(mol) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    从RDKit分子中提取原子特征和坐标
-    
-    Args:
-        mol: RDKit分子对象
-    
-    Returns:
-        features: (n_atoms, n_features) 特征矩阵
-        coords: (n_atoms, 3) 坐标矩阵
-    """
+    """从RDKit分子中提取原子特征和坐标"""
     from rdkit import Chem
-    from rdkit.Chem import AllChem
-    
+
     n_atoms = mol.GetNumAtoms()
     features = np.zeros((n_atoms, N_FEATURES))
     coords = np.zeros((n_atoms, 3))
-    
-    # 获取构象
+
     if mol.GetNumConformers() == 0:
         raise ValueError("分子没有3D构象")
-    
+
     conf = mol.GetConformer()
-    
+
     for i, atom in enumerate(mol.GetAtoms()):
-        # 1. 元素类型 one-hot (10维)
         element = atom.GetSymbol()
         elem_idx = ELEMENT_TO_IDX.get(element, ELEMENT_TO_IDX['other'])
         features[i, elem_idx] = 1.0
-        
-        # 2. 杂化方式 one-hot (4维)
+
         hybrid = atom.GetHybridization()
         hybrid_str = str(hybrid)
         if 'SP3' in hybrid_str:
@@ -106,12 +175,9 @@ def extract_atom_features(mol) -> Tuple[np.ndarray, np.ndarray]:
         else:
             hybrid_idx = 3
         features[i, 10 + hybrid_idx] = 1.0
-        
-        # 3. 形式电荷 (1维)
+
         features[i, 14] = atom.GetFormalCharge()
-        
-        # 4. 是否是氢键供体 (1维)
-        # 简化判断：N或O上有H
+
         is_hbd = False
         if atom.GetSymbol() in ['N', 'O']:
             for neighbor in atom.GetNeighbors():
@@ -119,25 +185,17 @@ def extract_atom_features(mol) -> Tuple[np.ndarray, np.ndarray]:
                     is_hbd = True
                     break
         features[i, 15] = float(is_hbd)
-        
-        # 5. 是否是氢键受体 (1维)
-        # 简化判断：N或O
+
         is_hba = atom.GetSymbol() in ['N', 'O']
         features[i, 16] = float(is_hba)
-        
-        # 6. 是否是芳香族 (1维)
+
         features[i, 17] = float(atom.GetIsAromatic())
-        
-        # 7. 原子度数 (1维，归一化）
-        features[i, 18] = atom.GetDegree() / 4.0  # 归一化到[0,1]
-        
-        # 8. 原子质量 (1维，归一化)
+        features[i, 18] = atom.GetDegree() / 4.0
         features[i, 19] = atom.GetMass() / 100.0
-        
-        # 坐标
+
         pos = conf.GetAtomPosition(i)
         coords[i] = [pos.x, pos.y, pos.z]
-    
+
     return features, coords
 
 
@@ -146,52 +204,166 @@ def process_sequence(sequence: str,
                      crosslinker: Optional[str] = None,
                      crosslinker_positions: Optional[List[int]] = None,
                      random_seed: int = 42) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
-    """
-    处理单个序列
-    
-    Args:
-        sequence: 氨基酸序列
-        energy: Vina结合能
-        crosslinker: 交联剂类型
-        crosslinker_positions: Cys连接位置
-        random_seed: 随机种子
-    
-    Returns:
-        (features, coords, energy) 或 None（如果失败）
-    """
+    """处理单个序列"""
     try:
-        # 1. 构建分子（含交联剂）
-        from ligand_generator import add_crosslinker
         mol = build_peptide_with_rdkit(sequence)
-        
-        # 2. 添加交联剂（如果指定）
         if crosslinker and crosslinker_positions:
             mol = add_crosslinker(mol, crosslinker, crosslinker_positions, sequence)
-        
-        # 3. 生成3D构象
+
         mol = generate_3d_conformation(mol, random_seed)
-        
-        # 4. 提取特征
         features, coords = extract_atom_features(mol)
-        
+
         return features, coords, energy
-        
+
     except Exception as e:
-        print(f"处理序列 {sequence} 失败: {e}")
+        print(f"  【失败】{e}")
         return None
 
 
-def load_data(sequences_file: Path, energies_file: Path) -> List[Tuple[str, float]]:
+# =============================================================================
+# 主函数
+# =============================================================================
+def main(sequences_file: Optional[Path] = None,
+         energies_file: Optional[Path] = None,
+         output_dir: Optional[Path] = None,
+         cache_file: Optional[Path] = None,
+         processed_file: Optional[Path] = None,
+         batch_size: int = 10,
+         target_name: Optional[str] = None):
     """
-    加载序列和能量数据
-    
+    主函数 - 增量处理，不删除源文件
+
     Args:
-        sequences_file: 序列文件路径
-        energies_file: 能量文件路径
-    
-    Returns:
-        [(序列, 能量), ...]
+        target_name: 靶点名称（用于确定EGNN数据目录）
     """
+    # 如果未指定target_name，尝试从energies_file路径提取
+    if target_name is None and energies_file is not None:
+        # 尝试从路径提取: results/{target_name}/energies.csv
+        parent = energies_file.parent
+        if parent.parent.name == "results":
+            target_name = parent.name
+        else:
+            target_name = "default"
+
+    # 使用target_name确定EGNN目录
+    if target_name is not None:
+        egnn_dirs = config.get_egnn_dirs(target_name)
+        if output_dir is None:
+            output_dir = egnn_dirs["raw"]
+        if cache_file is None:
+            cache_file = output_dir / "processed_cache.npz"
+        if processed_file is None:
+            processed_file = output_dir / "processed_sequences.txt"
+    else:
+        # fallback：使用原默认路径
+        if output_dir is None:
+            output_dir = config.BASE_DIR / "egnn" / "raw"
+        if cache_file is None:
+            cache_file = output_dir / "processed_cache.npz"
+        if processed_file is None:
+            processed_file = output_dir / "processed_sequences.txt"
+
+    # ... 其余代码保持不变
+    print("EGNN数据准备 (增量处理版 - 不删除源文件)")
+    print("=" * 60)
+
+    # 1. 加载已处理序列
+    print(f"\n[1/5] 加载已处理记录...")
+    processed_set = load_processed_set(processed_file)
+    print(f"  已处理: {len(processed_set)} 个序列")
+
+    # 2. 加载源数据
+    print(f"\n[2/5] 加载源数据...")
+    data = load_data(sequences_file, energies_file)
+    if not data:
+        print("  没有有效数据")
+        return
+
+    sequences = [seq for seq, _ in data]
+    energies = {seq: eng for seq, eng in data}
+    print(f"  总序列: {len(sequences)} 个")
+
+    # 3. 筛选未处理的序列
+    pending = [(seq, energies[seq]) for seq in sequences if seq not in processed_set]
+    print(f"  待处理: {len(pending)} 个")
+
+    if not pending:
+        print("\n  ✅ 所有序列已处理完成！")
+        # 直接划分数据集
+        split_and_save_dataset(cache_file, output_dir)
+        return
+
+    # 4. 处理序列（每 batch_size 个保存一次）
+    print(f"\n[3/5] 处理序列 (每{batch_size}个保存一次)...")
+    crosslinker = config.CROSSLINKER
+    crosslinker_positions = config.CROSSLINKER_POSITIONS
+
+    # 加载已有缓存
+    features_list, coords_list, energies_list, seq_set = load_cache(cache_file)
+
+    success_count = 0
+    fail_count = 0
+    total = len(pending)
+    new_sequences = []  # 记录本次新处理的序列
+
+    for i, (seq, energy) in enumerate(pending, 1):
+        print(f"  处理 {i}/{total}: {seq[:20]}...", end=" ")
+
+        # 检查是否已在缓存中（双重保险）
+        if seq in seq_set:
+            print("⏭️ 已缓存，跳过")
+            continue
+
+        result = process_sequence(seq, energy, crosslinker, crosslinker_positions)
+
+        if result:
+            features, coords, eng = result
+            features_list.append(features)
+            coords_list.append(coords)
+            energies_list.append(eng)
+            seq_set.add(seq)
+            new_sequences.append(seq)
+            success_count += 1
+            print("✓")
+        else:
+            fail_count += 1
+            print("✗")
+
+        # 每 batch_size 个保存一次缓存和已处理记录
+        if i % batch_size == 0 or i == total:
+            save_cache(cache_file, features_list, coords_list, energies_list, seq_set)
+            # 追加已处理记录
+            if new_sequences:
+                append_processed(processed_file, new_sequences)
+                new_sequences = []  # 清空，避免重复追加
+            print(f"    【保存】已处理 {success_count}/{total}，缓存已更新")
+
+    # 最后再保存一次（确保所有数据都写入）
+    save_cache(cache_file, features_list, coords_list, energies_list, seq_set)
+    if new_sequences:
+        append_processed(processed_file, new_sequences)
+
+    print(f"\n  处理完成: 成功 {success_count}，失败 {fail_count}")
+    print(f"  缓存总计: {len(seq_set)} 个样本")
+
+    # 5. 划分并保存数据集
+    print(f"\n[4/5] 划分并保存数据集...")
+    split_and_save_dataset(cache_file, output_dir)
+
+    # 6. 统计
+    print(f"\n[5/5] 统计信息...")
+    print(f"  已处理记录: {len(load_processed_set(processed_file))} 个")
+    print(f"  缓存样本: {len(seq_set)} 个")
+
+    print("\n" + "=" * 60)
+    print("EGNN数据准备完成!")
+    print(f"缓存文件: {cache_file}")
+    print(f"已处理记录: {processed_file}")
+    print("=" * 60)
+
+
+def load_data(sequences_file: Path, energies_file: Path) -> List[Tuple[str, float]]:
+    """加载序列和能量数据（不修改源文件）"""
     # 读取序列
     sequences = []
     with open(sequences_file, 'r') as f:
@@ -199,7 +371,7 @@ def load_data(sequences_file: Path, energies_file: Path) -> List[Tuple[str, floa
             line = line.strip()
             if line and not line.startswith('#') and ',' not in line:
                 sequences.append(line)
-    
+
     # 读取能量
     energies = {}
     with open(energies_file, 'r') as f:
@@ -213,159 +385,96 @@ def load_data(sequences_file: Path, energies_file: Path) -> List[Tuple[str, floa
                     energies[seq] = energy
                 except ValueError:
                     continue
-    
-    # 匹配序列和能量
+
+    # 匹配
     data = []
     for seq in sequences:
         if seq in energies:
             data.append((seq, energies[seq]))
-    
+
     return data
 
 
-def split_data(data: List, train_ratio=0.8, val_ratio=0.1) -> Tuple[List, List, List]:
-    """
-    划分数据集
-    
-    Args:
-        data: 数据列表
-        train_ratio: 训练集比例
-        val_ratio: 验证集比例
-    
-    Returns:
-        (train_data, val_data, test_data)
-    """
-    random.shuffle(data)
-    
-    n = len(data)
-    n_train = int(n * train_ratio)
-    n_val = int(n * val_ratio)
-    
-    train_data = data[:n_train]
-    val_data = data[n_train:n_train + n_val]
-    test_data = data[n_train + n_val:]
-    
-    return train_data, val_data, test_data
+def split_and_save_dataset(cache_file: Path, output_dir: Path,
+                           train_ratio: float = 0.8, val_ratio: float = 0.1):
+    """从缓存中读取所有数据，按比例划分并保存"""
+    features_list, coords_list, energies_list, seq_set = load_cache(cache_file)
 
-
-def save_dataset(data: List[Tuple[np.ndarray, np.ndarray, float]],
-                 output_file: Path):
-    """
-    保存数据集为npz格式
-    
-    Args:
-        data: [(features, coords, energy), ...]
-        output_file: 输出文件路径
-    """
-    if not data:
-        print(f"警告: 数据集为空，跳过保存 {output_file}")
+    if len(energies_list) == 0:
+        print("  错误: 缓存中没有数据")
         return
-    
-    # 由于每个分子原子数不同，需要保存为列表
-    features_list = [item[0] for item in data]
-    coords_list = [item[1] for item in data]
-    energies = np.array([item[2] for item in data])
-    
-    output_file = Path(output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # 【修复1】使用allow_pickle=True保存对象数组，支持不同长度的特征
-    np.savez_compressed(
-        output_file,
-        features=np.array(features_list, dtype=object),
-        coords=np.array(coords_list, dtype=object),
-        energies=energies,
-        allow_pickle=True
-    )
-    
-    print(f"✓ 保存数据集: {output_file} ({len(data)} 个样本)")
 
+    total = len(energies_list)
+    n_train = int(total * train_ratio)
+    n_val = int(total * val_ratio)
 
-def main(sequences_file: Optional[Path] = None,
-         energies_file: Optional[Path] = None,
-         output_dir: Optional[Path] = None):
-    """
-    主函数
-    
-    Args:
-        sequences_file: 序列文件路径
-        energies_file: 能量文件路径
-        output_dir: 输出目录
-    """
-    # 默认路径
-    if sequences_file is None:
-        sequences_file = config.BASE_DIR / "sequences.txt"
-    if energies_file is None:
-        energies_file = config.RESULTS_DIR / "1LYZ" / "energies.csv"
-    if output_dir is None:
-        output_dir = config.BASE_DIR / "egnn" / "raw"
-    
-    print("="*60)
-    print("EGNN数据准备")
-    print("="*60)
-    
-    # 1. 加载数据
-    print(f"\n[1/4] 加载数据...")
-    data = load_data(sequences_file, energies_file)
-    print(f"  加载 {len(data)} 个样本")
-    
-    if len(data) == 0:
-        print("错误: 没有有效数据")
-        return
-    
-    # 2. 处理序列
-    print(f"\n[2/4] 处理序列...")
-    processed_data = []
-    
-    crosslinker = config.CROSSLINKER
-    crosslinker_positions = config.CROSSLINKER_POSITIONS
-    
-    for i, (seq, energy) in enumerate(data):
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  处理 {i+1}/{len(data)}: {seq}")
-        
-        result = process_sequence(seq, energy, crosslinker, crosslinker_positions)
-        if result:
-            processed_data.append(result)
-    
-    print(f"  成功处理 {len(processed_data)}/{len(data)} 个样本")
-    
-    if len(processed_data) == 0:
-        print("错误: 没有成功处理的样本")
-        return
-    
-    # 3. 划分数据集
-    print(f"\n[3/4] 划分数据集...")
-    train_data, val_data, test_data = split_data(processed_data)
-    print(f"  训练集: {len(train_data)}")
-    print(f"  验证集: {len(val_data)}")
-    print(f"  测试集: {len(test_data)}")
-    
-    # 4. 保存数据集
-    print(f"\n[4/4] 保存数据集...")
+    print(f"  总样本: {total}")
+    print(f"  训练: {n_train}")
+    print(f"  验证: {n_val}")
+    print(f"  测试: {total - n_train - n_val}")
+
+    # 打乱数据
+    indices = list(range(total))
+    random.shuffle(indices)
+
+    train_idx = indices[:n_train]
+    val_idx = indices[n_train:n_train + n_val]
+    test_idx = indices[n_train + n_val:]
+
+    train_data = [(features_list[i], coords_list[i], energies_list[i]) for i in train_idx]
+    val_data = [(features_list[i], coords_list[i], energies_list[i]) for i in val_idx]
+    test_data = [(features_list[i], coords_list[i], energies_list[i]) for i in test_idx]
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    save_dataset(train_data, output_dir / "train_data.npz")
-    save_dataset(val_data, output_dir / "val_data.npz")
-    save_dataset(test_data, output_dir / "test_data.npz")
-    
-    print("\n" + "="*60)
-    print("EGNN数据准备完成!")
-    print("="*60)
+
+    def save_data(data, name):
+        if not data:
+            print(f"    【警告】{name} 为空")
+            return
+        features_arr = np.array([d[0] for d in data], dtype=object)
+        coords_arr = np.array([d[1] for d in data], dtype=object)
+        energies_arr = np.array([d[2] for d in data])
+        np.savez_compressed(
+            output_dir / name,
+            features=features_arr,
+            coords=coords_arr,
+            energies=energies_arr,
+            allow_pickle=True
+        )
+        print(f"    ✓ {name}: {len(data)} 个样本")
+
+    save_data(train_data, "train_data.npz")
+    save_data(val_data, "val_data.npz")
+    save_data(test_data, "test_data.npz")
 
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description='EGNN数据准备')
+
+    parser = argparse.ArgumentParser(description='EGNN数据准备（增量处理版）')
     parser.add_argument('-s', '--sequences', type=Path, default=None,
-                       help='序列文件路径')
+                        help='序列文件路径')
     parser.add_argument('-e', '--energies', type=Path, default=None,
-                       help='能量文件路径')
+                        help='能量文件路径')
     parser.add_argument('-o', '--output', type=Path, default=None,
-                       help='输出目录')
-    
+                        help='输出目录')
+    parser.add_argument('--cache', type=Path, default=None,
+                        help='缓存文件路径')
+    parser.add_argument('--processed', type=Path, default=None,
+                        help='已处理序列记录文件路径')
+    parser.add_argument('--batch-size', type=int, default=10,
+                        help='每批处理数量（默认10）')
+    parser.add_argument('--target', type=str, default=None,
+                        help='靶点名称（用于确定EGNN目录）')
+
     args = parser.parse_args()
-    
-    main(args.sequences, args.energies, args.output)
+    main(
+        sequences_file=args.sequences,
+        energies_file=args.energies,
+        output_dir=args.output,
+        cache_file=args.cache,
+        processed_file=args.processed,
+        batch_size=args.batch_size,
+        target_name=args.target  # ← 新增
+    )

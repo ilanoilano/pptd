@@ -108,7 +108,7 @@ def g_n(n: int) -> int:
     每个母节点的随机填充数（随EGNN轮次递减）
     第1轮: 50个，之后每轮-2，下限10
     """
-    return max(50 - (n - 1) * 2, 14)
+    return max(26 - (n - 1) * 2, 14)
 
 def h_n(n: int) -> int:
     """
@@ -141,10 +141,10 @@ MCTS_CONFIG = {
 EGNN_CONFIG = {
     "hidden_dim": 128,          # EGNN 隐藏层维度
     "num_layers": 4,            # EGNN 层数
-    "learning_rate": 1e-3,      # 学习率
+    "learning_rate": 5e-4,      # 学习率
     "batch_size": 4,           # 批次大小
     "num_epochs": 100,          # 训练轮数
-    "patience": 3,              # 早停耐心值
+    "patience": 5,              # 早停耐心值
 }
 
 
@@ -152,7 +152,7 @@ EGNN_CONFIG = {
 # Vina 对接配置
 # =============================================================================
 VINA_CONFIG = {
-    "exhaustiveness": 2,        # 搜索详尽度
+    "exhaustiveness": 6,        # 搜索详尽度
     "num_modes": 9,             # 输出构象数量
     "energy_range": 4,          # 能量范围（kcal/mol）
     "cpu": 8,                   # CPU核心数
@@ -162,7 +162,7 @@ VINA_CONFIG = {
 # =============================================================================
 VINA_VALIDATION = {
     "enable": True,              # 是否启用验证
-    "max_distance": 7.0,         # 质心到口袋最大距离 (Å)
+    "max_distance": 7,         # 质心到口袋最大距离 (Å)
     "min_atoms": 30,             # 最小原子数
     "max_atoms": 2000,            # 最大原子数
     "min_energy": -15.0,         # 最小结合能

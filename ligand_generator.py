@@ -9,6 +9,7 @@ import os
 import sys
 import subprocess
 import tempfile
+import math
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
@@ -57,7 +58,7 @@ AA_SMILES = {
 # 交联剂SMILES
 # 【修复】TBMB使用Kekulé形式（明确指定双键），避免芳香环kekulization问题
 CROSSLINKER_SMILES = {
-    "TBMB": "C1=CC(CBr)=CC(CBr)=C1CBr",  # Kekulé形式，明确双键
+    "TBMB": "BrCC1=CC(CBr)=CC(CBr)=C1",  # Kekulé形式，明确双键
     "TATA": "C(CS)(CS)CS",
     "TBAB": "C1=C(CBr)C=C(CBr)C(CBr)=C1CBr",  # Kekulé形式
 }
@@ -205,62 +206,38 @@ def find_cys_sulfur_atoms(mol, sequence):
     return sulfur_indices
 
 
-def add_crosslinker(mol: 'Chem.Mol', 
-                    crosslinker_type: str, 
+def add_crosslinker(mol: 'Chem.Mol',
+                    crosslinker_type: str,
                     cys_positions: List[int],
                     sequence: str) -> 'Chem.Mol':
     """
-    添加交联剂到分子
-    
-    【修复】正确找到Cys的硫原子并创建C-S键
-    
-    Args:
-        mol: 肽分子
-        crosslinker_type: 交联剂类型
-        cys_positions: Cys在序列中的位置列表（0-based）
-        sequence: 氨基酸序列（用于找到正确的Cys）
-    
-    Returns:
-        含交联剂的分子
+    添加交联剂到分子（安全版本）
+
+    使用 RWMol 避免索引错误
     """
     from rdkit import Chem
-    
+
     if crosslinker_type not in CROSSLINKER_SMILES:
         print(f"【警告】未知交联剂类型: {crosslinker_type}，跳过添加")
         return mol
-    
-    # 获取交联剂SMILES
+
+    # 1. 构建交联剂
     xlinker_smiles = CROSSLINKER_SMILES[crosslinker_type]
     xlinker_mol = Chem.MolFromSmiles(xlinker_smiles)
-    
     if xlinker_mol is None:
-        xlinker_mol = Chem.MolFromSmiles(xlinker_smiles, sanitize=False)
-        if xlinker_mol is None:
-            print(f"【警告】无法解析交联剂SMILES: {xlinker_smiles}")
-            return mol
-        
-        try:
-            Chem.SanitizeMol(xlinker_mol)
-        except:
-            Chem.SanitizeMol(
-                xlinker_mol,
-                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
-                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
-            )
-    
-    # 【修复】找到所有Cys的硫原子
-    cys_sulfur_indices = find_cys_sulfur_atoms(mol, sequence)
-    
-    if not cys_sulfur_indices:
-        print(f"【警告】找不到Cys的硫原子")
+        print(f"【警告】无法解析交联剂SMILES: {xlinker_smiles}")
         return mol
-    
-    # 根据cys_positions选择要连接的硫原子
-    # cys_positions是序列位置，我们需要找到对应位置的Cys的硫原子
+
+    # 2. 找到 Cys 的硫原子
+    cys_sulfur_indices = find_cys_sulfur_atoms(mol, sequence)
+    if len(cys_sulfur_indices) < 3:
+        print(f"【警告】只有 {len(cys_sulfur_indices)} 个 Cys，需要 3 个")
+        return mol
+
+    # 3. 选择对应的硫原子
     selected_sulfur_indices = []
     for pos in cys_positions:
         if pos < len(sequence) and sequence[pos] == 'C':
-            # 找到第pos个Cys对应的硫原子
             cys_count = 0
             for i, aa in enumerate(sequence):
                 if aa == 'C':
@@ -268,103 +245,150 @@ def add_crosslinker(mol: 'Chem.Mol',
                         selected_sulfur_indices.append(cys_sulfur_indices[cys_count])
                         break
                     cys_count += 1
-    
-    if not selected_sulfur_indices:
-        print(f"【警告】无法找到指定位置的Cys硫原子")
+    print(
+        f"【DEBUG‑交联】传入cys_positions={cys_positions}, 解析得到硫原子索引selected_sulfur_indices={selected_sulfur_indices}")
+
+    if len(selected_sulfur_indices) < 3:
+        print(f"【警告】只找到 {len(selected_sulfur_indices)} 个 Cys 硫原子")
         return mol
-    
-    # 合并分子
-    combo = Chem.CombineMols(mol, xlinker_mol)
-    editable = Chem.EditableMol(combo)
-    
-    # 找到交联剂中的溴原子
-    xlinker_start_idx = mol.GetNumAtoms()
+
+    # 4. 合并分子
+    n_peptide_atoms = mol.GetNumAtoms()
+    combined = Chem.CombineMols(mol, xlinker_mol)
+    rw_mol = Chem.RWMol(combined)
+
+    # 5. 收集交联剂中的 Br 原子和对应的 C 原子
     br_indices = []
-    for i, atom in enumerate(xlinker_mol.GetAtoms()):
+    c_indices = []
+    for atom in xlinker_mol.GetAtoms():
         if atom.GetAtomicNum() == 35:  # Br
-            br_indices.append(xlinker_start_idx + i)
-    
-    # 创建C-S键（Cys的S与交联剂的C，通过删除Br）
-    bonds_created = 0
-    bond_details = []
-    for i, s_idx in enumerate(selected_sulfur_indices[:len(br_indices)]):
-        if i >= len(br_indices):
-            break
-        
-        br_idx = br_indices[i]
-        br_atom = combo.GetAtomWithIdx(br_idx)
-        
-        # 找到与Br相连的C（这是要与S连接的C）
-        c_idx = None
-        for neighbor in br_atom.GetNeighbors():
-            if neighbor.GetAtomicNum() == 6:  # C
-                c_idx = neighbor.GetIdx()
-                break
-        
-        if c_idx is not None:
-            # 删除Br原子
-            editable.RemoveAtom(br_idx)
-            
-            # 调整硫原子索引（如果Br在S之前）
-            adjusted_s_idx = s_idx
-            if br_idx < s_idx:
-                adjusted_s_idx -= 1
-            
-            # 调整C原子索引
-            adjusted_c_idx = c_idx
-            if br_idx < c_idx:
-                adjusted_c_idx -= 1
-            
-            # 创建C-S键
-            editable.AddBond(adjusted_s_idx, adjusted_c_idx, Chem.BondType.SINGLE)
-            bonds_created += 1
-            
-            bond_details.append({"s": adjusted_s_idx, "c": adjusted_c_idx})
-            
-            # 更新后续Br的索引（因为删除了一个原子）
-            for j in range(i + 1, len(br_indices)):
-                if br_indices[j] > br_idx:
-                    br_indices[j] -= 1
-    
-    # 记录调试信息到日志（不打印到控制台）
-    if log_crosslinker_debug:
-        log_crosslinker_debug(
-            cys_sulfur_indices=cys_sulfur_indices,
-            selected_sulfur_indices=selected_sulfur_indices,
-            br_indices=br_indices,
-            bonds_created=bonds_created,
-            bond_details=bond_details
-        )
-    
-    result_mol = editable.GetMol()
-    
-    # Sanitize - 使用更健壮的处理方式
-    sanitize_error = None
+            br_idx = atom.GetIdx() + n_peptide_atoms
+            br_indices.append(br_idx)
+            # 找到与 Br 相连的 C
+            for neighbor in atom.GetNeighbors():
+                if neighbor.GetAtomicNum() == 6:
+                    c_idx = neighbor.GetIdx() + n_peptide_atoms
+                    c_indices.append(c_idx)
+                    break
+
+    if len(br_indices) < 3:
+        print(f"【警告】交联剂中只有 {len(br_indices)} 个 Br")
+        return mol
+
+    # 6. 从最后一个 Br 开始删除（避免索引变化）
+    for br_idx in sorted(br_indices, reverse=True):
+        rw_mol.RemoveAtom(br_idx)
+
+    # 7. 调整 C 索引（因为删除了 Br）
+    # 删除 Br 后，C 的索引会变化
+    adjusted_c_indices = []
+    for c_idx in c_indices:
+        # 计算有多少个被删除的 Br 在 c_idx 之前
+        deleted_before = sum(1 for b in br_indices if b < c_idx)
+        adjusted_c_indices.append(c_idx - deleted_before)
+
+    print(f"【DEBUG】cys_positions: {cys_positions}")
+    print(f"【DEBUG】selected_sulfur_indices: {selected_sulfur_indices}")
+    print(f"【DEBUG】br_indices: {br_indices}")
+    print(f"【DEBUG】c_indices: {c_indices}")
+
+    # 8. 创建 C-S 键
+    for s_idx, c_idx in zip(selected_sulfur_indices[:3], adjusted_c_indices[:3]):
+        print(f"【DEBUG】连接 S@{s_idx} 到 C@{c_idx}")
+        # 调整 S 索引（删除的 Br 也可能在 S 之前）
+        deleted_before_s = sum(1 for b in br_indices if b < s_idx)
+        adjusted_s_idx = s_idx - deleted_before_s
+        rw_mol.AddBond(adjusted_s_idx, c_idx, Chem.BondType.SINGLE)
+
+    # 9. 转换为 Mol
+    result_mol = rw_mol.GetMol()
+
+    # ===== 诊断：检查分子是否完整 (环已闭合) =====
+    # 检查分子是否有多个碎片（如果有碎片，就说明交联断裂了）
+    frags = Chem.GetMolFrags(result_mol, asMols=False, sanitizeFrags=False)
+    print(f"【DEBUG】交联后分子碎片数量: {len(frags)}")
+    if len(frags) > 1:
+        print(f"【ERROR】分子有 {len(frags)} 个碎片，交联可能断裂了！")
+        # 打印每个碎片包含的原子序号
+        for i, frag in enumerate(frags):
+            print(f"  碎片 {i + 1}: {frag}")
+
+    # 10. Sanitize
     try:
         Chem.SanitizeMol(result_mol)
-        print(f"【ligand_generator】分子sanitization成功")
     except Exception as e:
-        sanitize_error = str(e)
-        print(f"【警告】标准sanitization失败: {e}")
-        print(f"【警告】尝试跳过kekulization...")
+        print(f"【警告】Sanitize 失败: {e}")
         try:
             Chem.SanitizeMol(
                 result_mol,
-                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ 
-                           Chem.SanitizeFlags.SANITIZE_KEKULIZE
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^
+                            Chem.SanitizeFlags.SANITIZE_KEKULIZE
             )
-            print(f"【ligand_generator】跳过kekulization后sanitization成功")
-        except Exception as e2:
-            print(f"【错误】跳过kekulization后仍然失败: {e2}")
-            print(f"【错误】分子可能有问题，但将继续尝试生成构象")
-    
+        except:
+            pass
+
     return result_mol
 
 
-def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42) -> 'Chem.Mol':
-    """生成3D构象"""
+
+def _validate_conformation_quality(mol: 'Chem.Mol', min_z_range: float = 2.0) -> bool:
+    """
+    验证3D构象质量，确保不是2D构象
+    
+    Args:
+        mol: 带3D构象的分子
+        min_z_range: Z轴最小范围（Å）
+    
+    Returns:
+        True if 构象质量合格
+    """
+    from rdkit import Chem
+    import numpy as np
+    
+    if mol.GetNumConformers() == 0:
+        return False
+    
+    conf = mol.GetConformer()
+    coords = []
+    for i in range(mol.GetNumAtoms()):
+        pos = conf.GetAtomPosition(i)
+        coords.append([pos.x, pos.y, pos.z])
+    
+    coords_array = np.array(coords)
+    x_range = coords_array[:, 0].max() - coords_array[:, 0].min()
+    y_range = coords_array[:, 1].max() - coords_array[:, 1].min()
+    z_range = coords_array[:, 2].max() - coords_array[:, 2].min()
+    
+    print(f"【ligand_generator】构象坐标范围 - X: {x_range:.2f}Å, Y: {y_range:.2f}Å, Z: {z_range:.2f}Å")
+    
+    # 检查Z轴范围（2D构象的Z范围接近0）
+    if z_range < min_z_range:
+        print(f"【警告】Z轴范围过小 ({z_range:.2f}Å < {min_z_range}Å)，可能是2D构象")
+        return False
+    
+    # 检查各轴范围是否合理（避免极端扁平构象）
+    if x_range < 1.0 or y_range < 1.0:
+        print(f"【警告】X或Y轴范围异常 (X={x_range:.2f}Å, Y={y_range:.2f}Å)")
+        return False
+    
+    return True
+
+
+def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42, target_name: str = None) -> 'Chem.Mol':
+    """
+    生成3D构象
+    
+    策略:
+    1. 首先尝试 RDKit ETKDGv3
+    2. 如果失败，回退到 OpenBabel --gen3D
+    
+    Returns:
+        带3D构象的分子
+    """
     from rdkit import Chem
     from rdkit.Chem import AllChem
+    import tempfile
+
     
     # 【修复】更健壮的sanitization处理
     try:
@@ -389,6 +413,7 @@ def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42) -> 'Chem.Mo
         print(f"【错误】添加氢原子失败: {e}")
         raise RuntimeError(f"无法为分子添加氢原子: {e}")
     
+    # ===== 方法1: RDKit ETKDGv3 =====
     success = False
     
     try:
@@ -398,46 +423,218 @@ def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42) -> 'Chem.Mo
         params.enforceChirality = False
         result = rdDistGeom.EmbedMolecule(mol, params)
         if result == 0:
-            success = True
+            # 【关键修复】验证构象质量，确保不是2D构象
+            if _validate_conformation_quality(mol):
+                success = True
+                print(f"【ligand_generator】✓ RDKit ETKDGv3 构象生成成功且质量合格")
+            else:
+                print(f"【警告】RDKit ETKDGv3 返回成功但构象质量不合格，视为失败")
     except Exception as e:
-        print(f"【警告】ETKDGv3失败: {e}")
+        print(f"【警告】RDKit ETKDGv3 失败: {e}")
     
+    # ===== 方法2: RDKit 标准 Embed =====
     if not success:
         try:
             result = AllChem.EmbedMolecule(mol, randomSeed=random_seed, maxAttempts=100)
             if result == 0:
-                success = True
+                # 【关键修复】验证构象质量
+                if _validate_conformation_quality(mol):
+                    success = True
+                    print(f"【ligand_generator】✓ RDKit 标准 Embed 构象生成成功且质量合格")
+                else:
+                    print(f"【警告】RDKit 标准 Embed 返回成功但构象质量不合格，视为失败")
         except Exception as e:
-            print(f"【警告】标准EmbedMolecule失败: {e}")
+            print(f"【警告】RDKit 标准 Embed 失败: {e}")
     
+    # ===== 方法3: RDKit 随机坐标 =====
     if not success:
         try:
             result = AllChem.EmbedMolecule(mol, useRandomCoords=True, maxAttempts=100, randomSeed=random_seed)
             if result == 0:
-                success = True
+                # 【关键修复】验证构象质量
+                if _validate_conformation_quality(mol):
+                    success = True
+                    print(f"【ligand_generator】✓ RDKit 随机坐标构象生成成功且质量合格")
+                else:
+                    print(f"【警告】RDKit 随机坐标返回成功但构象质量不合格，视为失败")
         except Exception as e:
-            print(f"【警告】随机坐标EmbedMolecule失败: {e}")
+            print(f"【警告】RDKit 随机坐标 Embed 失败: {e}")
+    
+    # ===== 方法4: OpenBabel 回退 =====
+    if not success:
+        print(f"【ligand_generator】RDKit 所有方法失败，回退到 OpenBabel...")
+        
+        try:
+            # 导出为 SMILES
+            smiles = Chem.MolToSmiles(mol)
+            print(f"【ligand_generator】SMILES: {smiles[:80]}...")
+            
+            with tempfile.TemporaryDirectory() as tmpdir:
+                input_smi = os.path.join(tmpdir, "input.smi")
+                output_sdf = os.path.join(tmpdir, "output.sdf")
+                
+                # 写入 SMILES
+                with open(input_smi, 'w') as f:
+                    f.write(smiles)
+                
+                # OpenBabel 生成3D构象
+                cmd = [
+                    "obabel",
+                    "-ismi", input_smi,
+                    "-osdf", "-O", output_sdf,
+                    "--gen3D", "best",
+                    "-h",
+                    "--minimize",
+                    "--ff", "MMFF94"
+                ]
+                
+                print(f"【ligand_generator】运行 OpenBabel: {' '.join(cmd)}")
+                
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=300
+                    )
+                    
+                    if result.returncode != 0:
+                        # 尝试快速模式
+                        print(f"【ligand_generator】尝试 OpenBabel 快速模式...")
+                        cmd_fast = [
+                            "obabel",
+                            "-ismi", input_smi,
+                            "-osdf", "-O", output_sdf,
+                            "--gen3D", "fast",
+                            "-h"
+                        ]
+                        result = subprocess.run(
+                            cmd_fast,
+                            capture_output=True,
+                            text=True,
+                            timeout=300
+                        )
+                        
+                        if result.returncode != 0:
+                            raise RuntimeError(f"OpenBabel 失败: {result.stderr}")
+                    
+                    print(f"【ligand_generator】✓ OpenBabel 3D构象生成完成")
+                    
+                    # 读取3D构象回 RDKit
+                    supplier = Chem.SDMolSupplier(output_sdf, removeHs=False)
+                    mol_3d = next(supplier)
+                    
+                    if mol_3d is None:
+                        raise RuntimeError("无法从 SDF 读取分子")
+                    
+                    if mol_3d.GetNumConformers() == 0:
+                        raise RuntimeError("OpenBabel 生成的分子没有3D构象")
+                    
+                    mol = mol_3d
+                    success = True
+                    print(f"【ligand_generator】✓ OpenBabel 构象读取成功")
+                    
+                except FileNotFoundError:
+                    print(f"【错误】OpenBabel 未安装，跳过")
+                    raise RuntimeError("所有构象生成方法都失败，且 OpenBabel 未安装")
+                    
+        except Exception as e:
+            print(f"【错误】OpenBabel 回退失败: {e}")
     
     if not success:
-        raise RuntimeError("所有构象生成方法都失败")
+        raise RuntimeError("所有构象生成方法都失败（RDKit 和 OpenBabel）")
     
+    # ===== 构象优化 =====
     try:
         AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
+        print(f"【ligand_generator】✓ MMFF 优化完成")
     except:
         try:
             AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+            print(f"【ligand_generator】✓ UFF 优化完成")
         except:
             print("【警告】构象优化失败，使用未优化的构象")
     
-    # 【修改点1】RDKit计算Gasteiger电荷
+    # ===== 验证3D构象质量 =====
+    try:
+        import numpy as np
+        conf = mol.GetConformer()
+        coords = []
+        for i in range(mol.GetNumAtoms()):
+            pos = conf.GetAtomPosition(i)
+            coords.append([pos.x, pos.y, pos.z])
+        
+        coords_array = np.array(coords)
+        x_range = coords_array[:, 0].max() - coords_array[:, 0].min()
+        y_range = coords_array[:, 1].max() - coords_array[:, 1].min()
+        z_range = coords_array[:, 2].max() - coords_array[:, 2].min()
+        
+        print(f"【ligand_generator】坐标范围 - X: {x_range:.2f}Å, Y: {y_range:.2f}Å, Z: {z_range:.2f}Å")
+        
+        if z_range < 2.0:
+            print(f"【警告】Z轴范围过小 ({z_range:.2f}Å)，3D构象可能异常")
+        else:
+            print(f"【ligand_generator】✓ 3D构象质量正常")
+            
+    except Exception as e:
+        print(f"【警告】无法验证3D构象质量: {e}")
+    
+    # ===== 计算 Gasteiger 电荷 =====
     print(f"【ligand_generator】计算Gasteiger电荷...")
     try:
-        from rdkit.Chem import AllChem
         AllChem.ComputeGasteigerCharges(mol)
         print(f"【ligand_generator】✓ Gasteiger电荷计算完成")
     except Exception as e:
         print(f"【警告】Gasteiger电荷计算失败: {e}")
         print(f"【警告】将继续生成PDBQT，但电荷可能为0")
+    
+    # ===== 平移到口袋中心（作为Vina初始位置）=====
+    if target_name is not None:
+        try:
+            import sys
+            sys.path.insert(0, str(Path(__file__).parent))
+            from vina import get_pocket_center
+            
+            pocket_center = get_pocket_center(target_name)
+            if pocket_center is not None:
+                # 计算当前质心
+                conf = mol.GetConformer()
+                coords = []
+                for i in range(mol.GetNumAtoms()):
+                    pos = conf.GetAtomPosition(i)
+                    coords.append([pos.x, pos.y, pos.z])
+                
+                import numpy as np
+                coords_array = np.array(coords)
+                current_centroid = np.mean(coords_array, axis=0)
+                
+                # 计算平移向量（将质心移到口袋中心）
+                translation = pocket_center - current_centroid
+                
+                print(f"【ligand_generator】平移配体到口袋中心...")
+                print(f"  平移向量: ({translation[0]:.2f}, {translation[1]:.2f}, {translation[2]:.2f})")
+                
+                # 应用平移
+                for i in range(mol.GetNumAtoms()):
+                    pos = conf.GetAtomPosition(i)
+                    new_pos = Chem.rdGeometry.Point3D(
+                        pos.x + translation[0],
+                        pos.y + translation[1],
+                        pos.z + translation[2]
+                    )
+                    conf.SetAtomPosition(i, new_pos)
+                
+                # 验证新质心
+                new_coords = []
+                for i in range(mol.GetNumAtoms()):
+                    pos = conf.GetAtomPosition(i)
+                    new_coords.append([pos.x, pos.y, pos.z])
+                new_centroid = np.mean(np.array(new_coords), axis=0)
+                print(f"  新质心: ({new_centroid[0]:.2f}, {new_centroid[1]:.2f}, {new_centroid[2]:.2f})")
+            else:
+                print(f"【警告】无法获取口袋中心，跳过平移")
+        except Exception as e:
+            print(f"【警告】平移到口袋中心失败: {e}")
     
     return mol
 
@@ -597,7 +794,7 @@ def mol_to_pdbqt(mol: 'Chem.Mol', output_path: Path) -> Path:
     return output_path
 
 
-def generate_ligand(sequence: str,
+def generate_ligand(sequence: str, target_name: Optional[str] = None,
                     crosslinker: Optional[str] = None,
                     crosslinker_positions: Optional[List[int]] = None,
                     output_dir: Optional[Path] = None,
@@ -642,10 +839,31 @@ def generate_ligand(sequence: str,
     
     # 3. 生成3D构象
     print(f"【ligand_generator】生成3D构象...")
-    mol = generate_3d_conformation(mol, random_seed)
-    
+    # 尝试获取 target_name
+    target_name = getattr(config, "TARGET_NAME", None)
+    if target_name is None:
+            # 尝试从环境变量获取
+        import os
+        target_name = os.environ.get("TARGET_NAME", None)
+    if target_name is None:
+            # 尝试从 results 目录推断
+        results_dir = getattr(config, "RESULTS_DIR", None)
+        if results_dir and results_dir.exists():
+            subdirs = [d for d in results_dir.iterdir() if d.is_dir()]
+            if len(subdirs) == 1:
+                target_name = subdirs[0].name
+                print(f"【ligand_generator】推断 target_name: {target_name}")
+        mol = generate_3d_conformation(mol, random_seed, target_name=target_name)
+    if mol.GetNumConformers() == 0:
+        raise RuntimeError("分子没有 3D 构象")
+
+    # 检查坐标
+    conf = mol.GetConformer()
+    for i in range(mol.GetNumAtoms()):
+        pos = conf.GetAtomPosition(i)
+        if any(math.isnan(c) for c in [pos.x, pos.y, pos.z]):
+            raise RuntimeError(f"原子 {i} 坐标包含 NaN")
     # 4. 转换为PDBQT
-    print(f"【ligand_generator】转换为PDBQT...")
     pdbqt_path = mol_to_pdbqt(mol, output_pdbqt)
     
     print(f"【ligand_generator】✓ 完成: {pdbqt_path}")

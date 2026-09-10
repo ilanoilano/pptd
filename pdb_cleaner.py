@@ -48,22 +48,23 @@ def run_pdbfixer(input_pdb: Path, output_pdb: Path) -> bool:
     fixer.removeHeterogens(keepWater=False)
     
     # 3. 查找缺失残基
+    # 3. 查找缺失残基（新版本 pdbfixer 不需要 addMissingResidues）
     print("  查找缺失残基...")
     fixer.findMissingResidues()
     if fixer.missingResidues:
         print(f"    发现 {len(fixer.missingResidues)} 个缺失残基")
-        # 只添加非末端缺失的残基（保持结构完整性）
         chains = list(fixer.topology.chains())
         keys_to_remove = []
         for key in fixer.missingResidues:
             chain_idx, res_idx = key
-            # 跳过链末端
             if res_idx == 0 or res_idx >= len(list(chains[chain_idx].residues())):
                 keys_to_remove.append(key)
         for key in keys_to_remove:
             del fixer.missingResidues[key]
-        if fixer.missingResidues:
-            fixer.addMissingResidues()
+        # 新版本 pdbfixer 用 addMissingAtoms 自动处理缺失残基
+        # fixer.addMissingResidues()  # ← 删除或注释掉这行
+    # 直接跳到 addMissingAtoms
+    fixer.findMissingAtoms()
     
     # 4. 查找缺失原子
     print("  查找缺失原子...")

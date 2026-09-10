@@ -80,6 +80,9 @@ class SimulationEngine:
         # 【修复】使用项目目录下的临时文件夹
         self.temp_dir = TEMP_DIR
         self.temp_dir.mkdir(exist_ok=True)
+        
+        # 【新增】PDBQT 缓存，避免重复生成分子
+        self._pdbqt_cache = {}  # {sequence: pdbqt_path}
     
     @classmethod
     def increment_molecule_counter(cls):
@@ -168,13 +171,21 @@ class SimulationEngine:
         
         try:
             # 生成分子
-            pdbqt_path = generate_ligand(
-                sequence=state.sequence,
-                crosslinker=crosslinker,
-                crosslinker_positions=positions if positions else None,
-                output_dir=self.temp_dir,
-                random_seed=seed
-            )
+            # 【新增】检查缓存
+            cache_key = f"{state.sequence}_{seed}"
+            if cache_key in self._pdbqt_cache:
+                pdbqt_path = self._pdbqt_cache[cache_key]
+                print(f"  【缓存】使用已生成的配体: {pdbqt_path.name}")
+            else:
+                pdbqt_path = generate_ligand(
+                    sequence=state.sequence,
+                    crosslinker=crosslinker,
+                    crosslinker_positions=positions if positions else None,
+                    output_dir=self.temp_dir,
+                    random_seed=seed
+                )
+                # 缓存生成的 PDBQT 路径
+                self._pdbqt_cache[cache_key] = pdbqt_path
             
             # EGNN预测
             if self.egnn_model is None:
