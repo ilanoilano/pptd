@@ -45,6 +45,21 @@ RESULTS_DIR = BASE_DIR / "results"
 FINAL_DIR = BASE_DIR / "final"
 MODELS_DIR = BASE_DIR / "models"
 
+
+# =============================================================================
+# EGNN 靶点相关路径
+# =============================================================================
+
+def get_egnn_dirs(target_name: str) -> dict:
+    """获取指定靶点的EGNN工作目录"""
+    target_base = BASE_DIR / "egnn" / target_name
+    return {
+        "base": target_base,
+        "raw": target_base / "raw",
+        "models": target_base / "models",
+        "evaluate": target_base / "evaluate",
+    }
+
 # EGNN 模型路径
 def get_model_dir(target_name: str) -> Path:
     """获取指定靶点的模型目录"""
@@ -116,7 +131,7 @@ TOOLS = {
 # - 大写字母：固定氨基酸（如 A, C, G）
 # - x：可变位置，由 MCTS 搜索确定
 # 环肽格式：ACX₆CX₆CG（16个氨基酸，3个固定Cys，使用TBMB交联剂形成单环）
-PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
+PEPTIDE_TEMPLATE = "ACxxxCxxxCG"
 
 # 固定位置映射：{位置索引: 氨基酸}
 # 位置从0开始计数
@@ -124,9 +139,9 @@ PEPTIDE_TEMPLATE = "ACxxxxxxCxxxxxxCG"
 FIXED_POSITIONS = {
     0: "A",   # N端
     1: "C",   # 第一个半胱氨酸（TBMB连接位点1）
-    8: "C",   # 第二个半胱氨酸（TBMB连接位点2）
-    15: "C",  # C端
-    16: "G"
+    5: "C",   # 第二个半胱氨酸（TBMB连接位点2）
+    9: "C",  # C端
+    10: "G"
 }
 
 # 可变位置（模板中 'x' 的位置）
@@ -187,14 +202,10 @@ DISULFIDE_BONDS = []
 
 # 化学交联剂配置（必需，用于形成环肽）
 # 选项：None, "TBMB", "TATA", "TBAB"
-# TBMB: 三官能团交联剂，连接3个Cys形成1个环
 CROSSLINKER = "TBMB"
 
-# 交联剂连接位置（TBMB需要3个Cys）
-# ACX₆CX₆CG格式：Cys位于位置1, 8，第三个Cys需要在可变区域中指定
-# 这里配置前两个固定Cys的位置，第三个将在扩展时从可变区域选择
-CROSSLINKER_POSITIONS = [1,8,15]  # 基础位置，第三个Cys在可变区域中确定
-
+# 交联剂连接位置
+CROSSLINKER_POSITIONS = [1,5,9]
 # =============================================================================
 # 分子量筛选范围（Da）
 # =============================================================================
@@ -204,44 +215,6 @@ MOLECULAR_WEIGHT_RANGE = (800, 2000)
 # 【新增】自适应MCTS-EGNN闭环优化配置（V2版本）
 # =============================================================================
 
-# EGNN迭代轮次相关的动态函数
-# N: 当前EGNN迭代轮次（从1开始）
-
-def f_n(n: int) -> int:
-    """
-    选取母节点数量（随EGNN轮次递增）
-    第1轮: 19个，之后每轮+2，上限100
-    """
-    return min(19 + (2*n - 1) ** 2, 1000)
-
-def g_n(n: int) -> int:
-    """
-    每个母节点的随机填充数（随EGNN轮次递减）
-    第1轮: 50个，之后每轮-2，下限10
-    """
-    return max(50 - (n - 1) * 2, 10)
-
-def h_n(n: int) -> int:
-    """
-    Vina验证数量（随EGNN轮次递增）
-    第1轮: 40个，之后每轮+3，上限200
-    """
-    return min(80 + (n - 1) * 12, 500)
-
-# Softmax分配配置
-SOFTMAX_TEMPERATURE = 1.0       # Softmax温度参数
-MAX_EXPANSIONS_PER_NODE = 19    # 每个母节点最大扩展数（19种氨基酸）
-
-# 最大EGNN迭代轮数
-MAX_EGNN_ITERATIONS = 100
-CONVERGENCE_PATIENCE = 5        # 收敛判定耐心值（连续N轮无改善）
-
-# 保留旧配置（兼容性）
-MAX_RANDOM_FILL = 50            # 最大随机填充数（浅层）
-MIN_RANDOM_FILL = 10            # 最小随机填充数（深层）
-FILL_DECREMENT_PER_DEPTH = 2    # 每层深度减少的填充数
-INITIAL_VINA_BATCH = 40         # 初始Vina验证数量
-MIN_VINA_BATCH = 10             # 最小Vina验证数量（后期可减少）
 
 # 计算可变位置数（模板中'x'的数量）
 def _count_variable_positions(template: str = None) -> int:
@@ -258,25 +231,20 @@ MAX_PATH_LENGTH = VARIABLE_POSITIONS_COUNT
 
 # MCTS配置（V2版本 - 自适应参数）
 MCTS_CONFIG = {
-    "c_puct": 0.814,            # PUCT 探索常数
-    "n_simulations": 10,        # 每次迭代模拟次数
-    "esmif_top_k": 5,           # ESM-IF 压缩分支因子至 top-k
+    "c_puct": 1.414,            # PUCT 探索常数
     "max_expansions": 19,       # 每次扩展的最大子节点数（19种氨基酸，排除Cys）
-    "use_egnn_prior": True,     # 是否使用EGNN作为扩展先验
-    "prior_temperature": 1.0,   # EGNN先验温度参数
-    "softmax_temperature": 1.0, # Softmax分配温度
 }
 
 # =============================================================================
 # EGNN训练配置
 # =============================================================================
 EGNN_CONFIG = {
-    "hidden_dim": 128,          # EGNN 隐藏层维度
-    "num_layers": 4,            # EGNN 层数
-    "learning_rate": 1e-3,      # 学习率
-    "batch_size": 32,           # 批次大小
+    "hidden_dim": 64,          # EGNN 隐藏层维度
+    "num_layers": 3,            # EGNN 层数
+    "learning_rate": 5e-4,      # 学习率
+    "batch_size": 16,           # 批次大小
     "num_epochs": 100,          # 训练轮数
-    "patience": 3,              # 早停耐心值
+    "patience": 5,              # 早停耐心值
 }
 
 COLD_START_CONFIG = {
@@ -318,19 +286,32 @@ SCORING_WEIGHTS = {
 # Vina 对接配置（极致内存节省版 - 针对OOM优化）
 # =============================================================================
 VINA_CONFIG = {
-    "exhaustiveness": 2,        # 保持快速模式
-    "num_modes": 9,             # 输出构象数量
+    "exhaustiveness": 5,        # 保持快速模式
+    "num_modes":3,             # 输出构象数量
     "energy_range": 4,          # 能量范围（kcal/mol）
     "cpu": 8,                   # 降到8核（极致内存节省）
 }
 
+lr_recession=0.95
+
 VINA_VALIDATION = {
-    "enable": True,              # 是否启用验证
-    "max_distance": 7.0,         # 质心到口袋最大距离 (Å)
-    "min_atoms": 30,             # 最小原子数
-    "max_atoms": 2000,            # 最大原子数
-    "min_energy": -15.0,         # 最小结合能
-    "max_energy": -3.0,          # 最大结合能
+    "enable": True,                    # 是否启用验证
+    "use_pocket_boundary": True,       # 使用口袋边界精准验证（新）
+    "sample_ratio": 0.45,              # 采样比例（1/4 原子）
+    "inside_threshold": 0.25,           # 原子在口袋内的比例阈值
+    "boundary_margin": 2.0,            # 边界松弛距离（Å）
+    "max_distance": 7.0,               # 质心到口袋中心最大距离（备选）
+               # 最大原子数
+    "kd_tree_threshold": 4.5,
+    "min_energy": -15.0,               # 最小结合能
+    "max_energy": 0,                # 最大结合能
+    "multi_pocket": False,
+    "min_atoms": 15,              # 最小原子数（配体本身）
+    "max_atoms": 500,            # 最大原子数
+          # 最大结合能（-3 以上太弱，丢弃）
+    "min_contacts": 15,           # 【新增】最小接触原子数
+    "max_contacts": 60,
+    "contact_threshold": 4.0,
 }
 
 # 对接盒子默认尺寸（Å），实际从 fpocket 结果计算

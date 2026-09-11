@@ -65,14 +65,14 @@ CROSSLINKER_SMILES = {
 
 
 def find_carboxyl_carbon(mol):
-    """找到羧基碳（C端）"""
+    """找到 C 端羧基碳（排除侧链羧基，如 Asp/Glu）"""
     from rdkit import Chem
-    
+
     for atom in mol.GetAtoms():
         if atom.GetAtomicNum() == 6:  # 碳
             o_double = None
             o_single = None
-            
+
             for neighbor in atom.GetNeighbors():
                 if neighbor.GetAtomicNum() == 8:  # 氧
                     bond = mol.GetBondBetweenAtoms(atom.GetIdx(), neighbor.GetIdx())
@@ -80,10 +80,22 @@ def find_carboxyl_carbon(mol):
                         o_double = neighbor.GetIdx()
                     elif bond.GetBondType() == Chem.BondType.SINGLE:
                         o_single = neighbor.GetIdx()
-            
+
             if o_double is not None and o_single is not None:
-                return atom.GetIdx(), o_single
-    
+                # 【关键】检查这个羧基碳是否是主链上的（连接了 CA 和 N）
+                # C 端羧基碳应该连接一个 CA（α碳），CA 又连接一个 N
+                is_main_chain = False
+                for neighbor in atom.GetNeighbors():
+                    if neighbor.GetAtomicNum() == 6:  # 碳（CA）
+                        # 检查 CA 是否连接了一个 N
+                        for ca_neighbor in neighbor.GetNeighbors():
+                            if ca_neighbor.GetAtomicNum() == 7:  # 氮
+                                is_main_chain = True
+                                break
+
+                if is_main_chain:
+                    return atom.GetIdx(), o_single
+
     return None, None
 
 
@@ -180,156 +192,183 @@ def build_peptide_with_rdkit(sequence: str) -> 'Chem.Mol':
 
 def find_cys_sulfur_atoms(mol, sequence):
     """
-    找到所有Cys的硫原子索引
-    
+    找到所有 Cys 的硫原子索引（按序列中 Cys 的出现顺序）
+
+    关键：
+    - 只找 Cys 的 S，排除 Met 的 S
+    - Cys 的 S 连接在 CB 上（CB 连接 CA，CA 连接 N）
+    - Met 的 S 连接在 CG 上（CG 连接 CB，CB 连接 CA，多一层）
+
     Args:
         mol: 肽分子
         sequence: 氨基酸序列
-    
+
     Returns:
-        List[硫原子索引]
+        List[硫原子索引]，按序列中 Cys 的出现顺序排列
     """
     from rdkit import Chem
-    
-    sulfur_indices = []
-    
-    # 遍历分子中的所有硫原子
+
+    # 方法：利用 RDKit 构建顺序，S 原子的出现顺序与序列中 Cys 的顺序一致
+    # 但需要区分 Met 的 S（Met 的 S 在侧链末端，Cys 的 S 靠近主链）
+
+    cys_sulfur_indices = []
+    met_sulfur_indices = []
+
     for atom in mol.GetAtoms():
-        if atom.GetAtomicNum() == 16:  # S
-            # 确认这是Cys的硫（连接在CB上）
-            # Cys结构: N-CA-CB-S
-            for neighbor in atom.GetNeighbors():
-                if neighbor.GetAtomicNum() == 6:  # 碳（CB）
-                    sulfur_indices.append(atom.GetIdx())
-                    break
-    
-    return sulfur_indices
+        if atom.GetAtomicNum() != 16:  # 只看 S
+            continue
+
+        # 获取 S 的邻居碳
+        s_neighbors = [n for n in atom.GetNeighbors() if n.GetAtomicNum() == 6]
+        if not s_neighbors:
+            continue
+
+        c_connected_to_s = s_neighbors[0]
+
+        # 判断这个碳距离主链氮有多远
+        # Cys: S-CB-CA-N (距离2)
+        # Met: S-CG-CB-CA-N (距离3)
+
+        # 广度优先搜索，找最近的主链 N
+        from collections import deque
+        visited = {atom.GetIdx()}
+        queue = deque([(c_connected_to_s, 1)])  # (原子, 距离S的键数)
+
+        min_dist_to_n = None
+        while queue:
+            current_atom, dist = queue.popleft()
+
+            if current_atom.GetAtomicNum() == 7:  # 找到 N
+                min_dist_to_n = dist
+                break
+
+            if dist > 4:  # 限制搜索深度
+                continue
+
+            for neighbor in current_atom.GetNeighbors():
+                if neighbor.GetIdx() not in visited:
+                    visited.add(neighbor.GetIdx())
+                    queue.append((neighbor, dist + 1))
+
+        # 距离 N 为 2 → Cys
+        # 距离 N 为 3 → Met
+        if min_dist_to_n == 3:
+            cys_sulfur_indices.append(atom.GetIdx())
+        elif min_dist_to_n == 4:
+            met_sulfur_indices.append(atom.GetIdx())
+        else:
+            # 无法判断，默认当作 Cys
+            cys_sulfur_indices.append(atom.GetIdx())
+
+    # 验证
+    expected_cys = sum(1 for aa in sequence if aa == 'C')
+    if len(cys_sulfur_indices) != expected_cys:
+        print(f"【警告】序列中有 {expected_cys} 个 Cys，"
+              f"但找到 {len(cys_sulfur_indices)} 个 Cys 的 S，"
+              f"{len(met_sulfur_indices)} 个 Met 的 S")
+
+    return cys_sulfur_indices
 
 
 def add_crosslinker(mol: 'Chem.Mol',
                     crosslinker_type: str,
                     cys_positions: List[int],
                     sequence: str) -> 'Chem.Mol':
-    """
-    添加交联剂到分子（安全版本）
-
-    使用 RWMol 避免索引错误
-    """
     from rdkit import Chem
-
     if crosslinker_type not in CROSSLINKER_SMILES:
         print(f"【警告】未知交联剂类型: {crosslinker_type}，跳过添加")
         return mol
-
-    # 1. 构建交联剂
     xlinker_smiles = CROSSLINKER_SMILES[crosslinker_type]
     xlinker_mol = Chem.MolFromSmiles(xlinker_smiles)
     if xlinker_mol is None:
         print(f"【警告】无法解析交联剂SMILES: {xlinker_smiles}")
         return mol
 
-    # 2. 找到 Cys 的硫原子
-    cys_sulfur_indices = find_cys_sulfur_atoms(mol, sequence)
-    if len(cys_sulfur_indices) < 3:
-        print(f"【警告】只有 {len(cys_sulfur_indices)} 个 Cys，需要 3 个")
+    # 肽链内部，获取S原子【原始肽mol的局部ID】
+    cys_sulfur_local_indices = find_cys_sulfur_atoms(mol, sequence)
+    if len(cys_sulfur_local_indices) < 3:
+        print(f"【警告】只有 {len(cys_sulfur_local_indices)} 个 Cys，需要 3 个")
         return mol
 
-    # 3. 选择对应的硫原子
-    selected_sulfur_indices = []
+    selected_sulfur_local = []
     for pos in cys_positions:
         if pos < len(sequence) and sequence[pos] == 'C':
             cys_count = 0
             for i, aa in enumerate(sequence):
                 if aa == 'C':
-                    if i == pos and cys_count < len(cys_sulfur_indices):
-                        selected_sulfur_indices.append(cys_sulfur_indices[cys_count])
+                    if i == pos and cys_count < len(cys_sulfur_local_indices):
+                        selected_sulfur_local.append(cys_sulfur_local_indices[cys_count])
                         break
-                    cys_count += 1
-    print(
-        f"【DEBUG‑交联】传入cys_positions={cys_positions}, 解析得到硫原子索引selected_sulfur_indices={selected_sulfur_indices}")
+                    cys_count +=1
 
-    if len(selected_sulfur_indices) < 3:
-        print(f"【警告】只找到 {len(selected_sulfur_indices)} 个 Cys 硫原子")
+    print(f"【DEBUG‑交联】肽内部S局部索引 selected_sulfur_local={selected_sulfur_local}")
+    if len(selected_sulfur_local) <3:
+        print(f"【警告】只找到 {len(selected_sulfur_local)} 个Cys硫")
         return mol
 
-    # 4. 合并分子
     n_peptide_atoms = mol.GetNumAtoms()
+    # CombineMols(A,B): A全部复制到前面，ID完全不变；B从 n_peptide_atoms 开始
     combined = Chem.CombineMols(mol, xlinker_mol)
     rw_mol = Chem.RWMol(combined)
 
-    # 5. 收集交联剂中的 Br 原子和对应的 C 原子
+    # ✅肽S在combined中ID = 原始局部ID！！不加任何偏移！
+    sulfur_global = selected_sulfur_local[:3]
+    print(f"【DEBUG】合并后肽S全局ID（无偏移） sulfur_global={sulfur_global}")
+
     br_indices = []
-    c_indices = []
-    for atom in xlinker_mol.GetAtoms():
-        if atom.GetAtomicNum() == 35:  # Br
-            br_idx = atom.GetIdx() + n_peptide_atoms
-            br_indices.append(br_idx)
-            # 找到与 Br 相连的 C
-            for neighbor in atom.GetNeighbors():
-                if neighbor.GetAtomicNum() == 6:
-                    c_idx = neighbor.GetIdx() + n_peptide_atoms
-                    c_indices.append(c_idx)
-                    break
+    c_indices_xlinker_local = []
+    # 只遍历TBMB部分：[n_peptide_atoms ... end]
+    for idx in range(n_peptide_atoms, rw_mol.GetNumAtoms()):
+        atom = rw_mol.GetAtomWithIdx(idx)
+        if atom.GetAtomicNum() == 35:
+            br_indices.append(idx)
+            for nb in atom.GetNeighbors():
+                c_indices_xlinker_local.append(nb.GetIdx())
 
-    if len(br_indices) < 3:
-        print(f"【警告】交联剂中只有 {len(br_indices)} 个 Br")
-        return mol
+    print(f"【DEBUG】Br全局索引 br_indices={br_indices}")
+    print(f"【DEBUG】TBMB与Br相连C原始全局ID c_indices_xlinker_local={c_indices_xlinker_local}")
 
-    # 6. 从最后一个 Br 开始删除（避免索引变化）
+    # 逆序删除Br（大ID优先删，降低扰动）
     for br_idx in sorted(br_indices, reverse=True):
         rw_mol.RemoveAtom(br_idx)
 
-    # 7. 调整 C 索引（因为删除了 Br）
-    # 删除 Br 后，C 的索引会变化
-    adjusted_c_indices = []
-    for c_idx in c_indices:
-        # 计算有多少个被删除的 Br 在 c_idx 之前
-        deleted_before = sum(1 for b in br_indices if b < c_idx)
-        adjusted_c_indices.append(c_idx - deleted_before)
+    # 只修正TBMB内部C的ID：统计在该C前面被删掉多少Br
+    adjusted_c_global = []
+    for c_orig in c_indices_xlinker_local:
+        del_cnt = sum(1 for b in br_indices if b < c_orig)
+        adjusted_c_global.append(c_orig - del_cnt)
+    print(f"【DEBUG】TBMB修正后C全局ID adjusted_c_global={adjusted_c_global}")
 
-    print(f"【DEBUG】cys_positions: {cys_positions}")
-    print(f"【DEBUG】selected_sulfur_indices: {selected_sulfur_indices}")
-    print(f"【DEBUG】br_indices: {br_indices}")
-    print(f"【DEBUG】c_indices: {c_indices}")
+    num_atoms_now = rw_mol.GetNumAtoms()
+    # 边界检查
+    for s_g, c_g in zip(sulfur_global, adjusted_c_global):
+        if s_g >= num_atoms_now or c_g >= num_atoms_now:
+            raise RuntimeError(f"原子越界! S={s_g}, C={c_g}, total={num_atoms_now}")
+        print(f"【DEBUG‑FINAL BOND】连接 S@{s_g} <--> C@{c_g}")
+        rw_mol.AddBond(s_g, c_g, Chem.BondType.SINGLE)
 
-    # 8. 创建 C-S 键
-    for s_idx, c_idx in zip(selected_sulfur_indices[:3], adjusted_c_indices[:3]):
-        print(f"【DEBUG】连接 S@{s_idx} 到 C@{c_idx}")
-        # 调整 S 索引（删除的 Br 也可能在 S 之前）
-        deleted_before_s = sum(1 for b in br_indices if b < s_idx)
-        adjusted_s_idx = s_idx - deleted_before_s
-        rw_mol.AddBond(adjusted_s_idx, c_idx, Chem.BondType.SINGLE)
-
-    # 9. 转换为 Mol
     result_mol = rw_mol.GetMol()
-
-    # ===== 诊断：检查分子是否完整 (环已闭合) =====
-    # 检查分子是否有多个碎片（如果有碎片，就说明交联断裂了）
     frags = Chem.GetMolFrags(result_mol, asMols=False, sanitizeFrags=False)
     print(f"【DEBUG】交联后分子碎片数量: {len(frags)}")
     if len(frags) > 1:
-        print(f"【ERROR】分子有 {len(frags)} 个碎片，交联可能断裂了！")
-        # 打印每个碎片包含的原子序号
-        for i, frag in enumerate(frags):
-            print(f"  碎片 {i + 1}: {frag}")
+        print(f"【ERROR】碎片数量={len(frags)}，拓扑出错！")
+        for idx,frag in enumerate(frags):
+            print(f"  碎片{idx+1}: {frag}")
+        raise RuntimeError(f"交联产生多个碎片，碎片数={len(frags)}")
 
-    # 10. Sanitize
+    # sanitize
     try:
         Chem.SanitizeMol(result_mol)
     except Exception as e:
-        print(f"【警告】Sanitize 失败: {e}")
+        print(f"【警告】Sanitize失败: {e}")
         try:
             Chem.SanitizeMol(
                 result_mol,
-                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^
-                            Chem.SanitizeFlags.SANITIZE_KEKULIZE
+                sanitizeOps=Chem.SanitizeFlags.SANITIZE_ALL ^ Chem.SanitizeFlags.SANITIZE_KEKULIZE
             )
         except:
             pass
-
     return result_mol
-
-
 
 def _validate_conformation_quality(mol: 'Chem.Mol', min_z_range: float = 2.0) -> bool:
     """
@@ -574,16 +613,14 @@ def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42, target_name
         if z_range < 2.0:
             print(f"【警告】Z轴范围过小 ({z_range:.2f}Å)，3D构象可能异常")
         else:
-            print(f"【ligand_generator】✓ 3D构象质量正常")
+            pass
             
     except Exception as e:
         print(f"【警告】无法验证3D构象质量: {e}")
     
     # ===== 计算 Gasteiger 电荷 =====
-    print(f"【ligand_generator】计算Gasteiger电荷...")
     try:
         AllChem.ComputeGasteigerCharges(mol)
-        print(f"【ligand_generator】✓ Gasteiger电荷计算完成")
     except Exception as e:
         print(f"【警告】Gasteiger电荷计算失败: {e}")
         print(f"【警告】将继续生成PDBQT，但电荷可能为0")
@@ -610,8 +647,6 @@ def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42, target_name
                 
                 # 计算平移向量（将质心移到口袋中心）
                 translation = pocket_center - current_centroid
-                
-                print(f"【ligand_generator】平移配体到口袋中心...")
                 print(f"  平移向量: ({translation[0]:.2f}, {translation[1]:.2f}, {translation[2]:.2f})")
                 
                 # 应用平移
@@ -630,7 +665,6 @@ def generate_3d_conformation(mol: 'Chem.Mol', random_seed: int = 42, target_name
                     pos = conf.GetAtomPosition(i)
                     new_coords.append([pos.x, pos.y, pos.z])
                 new_centroid = np.mean(np.array(new_coords), axis=0)
-                print(f"  新质心: ({new_centroid[0]:.2f}, {new_centroid[1]:.2f}, {new_centroid[2]:.2f})")
             else:
                 print(f"【警告】无法获取口袋中心，跳过平移")
         except Exception as e:
@@ -723,7 +757,6 @@ def mol_to_pdbqt(mol: 'Chem.Mol', output_path: Path) -> Path:
     
     # 【关键修复】首先尝试使用RDKit直接生成PDBQT（保留电荷）
     try:
-        print(f"【ligand_generator】使用RDKit直接生成PDBQT...")
         return rdkit_mol_to_pdbqt(mol, output_path)
     except Exception as e:
         print(f"【警告】RDKit直接生成失败: {e}")
@@ -812,9 +845,7 @@ def generate_ligand(sequence: str, target_name: Optional[str] = None,
     
     seq_hash = hashlib.md5(f"{sequence}_{crosslinker}".encode()).hexdigest()[:8]
     output_pdbqt = output_dir / f"peptide_{seq_hash}.pdbqt"
-    
-    print(f"【ligand_generator】构建肽链: {sequence}")
-    
+    print(f"构建肽链：{sequence}")
     # 1. 构建肽链
     mol = build_peptide_with_rdkit(sequence)
     

@@ -21,7 +21,10 @@ EGNN训练模块 (EGNN_23.py)
 - egnn/models/training_history.json
 """
 
+
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 import sys
 import json
 import random
@@ -34,8 +37,6 @@ from typing import List, Tuple, Dict, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
 
-# 强制使用CPU，RTX 5060暂不支持CUDA
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -52,7 +53,11 @@ def set_seed(seed=42):
 
 
 # 设备配置
-DEVICE = torch.device('cpu')  # 强制CPU，RTX 5060暂不支持
+# 不再强制禁用CUDA，让PyTorch自动检测
+# os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 删除或注释掉这行
+
+# 设备配置：自动检测CUDA
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"使用设备: {DEVICE}")
 
 
@@ -67,7 +72,7 @@ class EGNNEncoder(nn.Module):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
-        
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # 输入投影
         self.input_proj = nn.Linear(in_features, hidden_dim)
         
@@ -263,49 +268,53 @@ def build_graph(features, coords, cutoff=5.0):
 def collate_graphs(batch_data):
     """
     将多个分子数据组合成一个batch
-    
-    Args:
-        batch_data: [(features, coords, energy), ...]
-    
-    Returns:
-        features: (total_atoms, n_features)
-        coords: (total_atoms, 3)
-        edge_index: (2, total_edges)
-        batch: (total_atoms,)
-        energies: (n_molecules,)
     """
     all_features = []
     all_coords = []
     all_edge_indices = []
     batch_indices = []
     energies = []
-    
+
     atom_offset = 0
-    
+
     for i, (features, coords, energy) in enumerate(batch_data):
+        # 确保 features 和 coords 是 numpy 数组
+        if isinstance(features, np.ndarray) and features.dtype == object:
+            features = np.array(features.tolist(), dtype=np.float32)
+        if isinstance(coords, np.ndarray) and coords.dtype == object:
+            coords = np.array(coords.tolist(), dtype=np.float32)
+
+        # 如果已经是 tensor，转换为 numpy
+        if torch.is_tensor(features):
+            features = features.numpy()
+        if torch.is_tensor(coords):
+            coords = coords.numpy()
+
+        # 确保是 float32
+        features = np.array(features, dtype=np.float32)
+        coords = np.array(coords, dtype=np.float32)
+
         n_atoms = len(features)
-        
+
         all_features.append(features)
         all_coords.append(coords)
         energies.append(energy)
-        
+
         # 构建图
         edge_index = build_graph(features, coords)
-        edge_index = edge_index + atom_offset  # 调整索引
+        edge_index = edge_index + atom_offset
         all_edge_indices.append(edge_index)
-        
-        # batch索引
+
         batch_indices.extend([i] * n_atoms)
-        
         atom_offset += n_atoms
-    
+
     # 拼接
     features = torch.tensor(np.concatenate(all_features, axis=0), dtype=torch.float32)
     coords = torch.tensor(np.concatenate(all_coords, axis=0), dtype=torch.float32)
     edge_index = torch.cat(all_edge_indices, dim=1)
     batch = torch.tensor(batch_indices, dtype=torch.long)
     energies = torch.tensor(energies, dtype=torch.float32)
-    
+
     return features, coords, edge_index, batch, energies
 
 
@@ -384,25 +393,31 @@ def main(data_dir: Optional[Path] = None,
          num_epochs: int = None,
          batch_size: int = None,
          lr: float = None,
-         patience: int = None):
+         patience: int = None,
+         C: float = None,
+         target_name: Optional[str] = None):
     """
     主训练函数
-    
-    参数优先级：传入值 > config.EGNN_CONFIG > 默认值
+
+    Args:
+        target_name: 靶点名称（用于确定EGNN目录）
     """
-    # 从config读取默认值（如果未传入）
-    if hidden_dim is None:
-        hidden_dim = config.EGNN_CONFIG.get("hidden_dim", 128)
-    if num_layers is None:
-        num_layers = config.EGNN_CONFIG.get("num_layers", 4)
-    if num_epochs is None:
-        num_epochs = config.EGNN_CONFIG.get("num_epochs", 100)
-    if batch_size is None:
-        batch_size = config.EGNN_CONFIG.get("batch_size", 8)
-    if lr is None:
-        lr = config.EGNN_CONFIG.get("learning_rate", 1e-3)
-    if patience is None:
-        patience = config.EGNN_CONFIG.get("patience", 3)
+    # 使用target_name确定EGNN目录
+    C=config.lr_recession
+    if target_name is not None:
+        egnn_dirs = config.get_egnn_dirs(target_name)
+        if data_dir is None:
+            data_dir = egnn_dirs["raw"]
+        if output_dir is None:
+            output_dir = egnn_dirs["models"]
+    else:
+        # fallback：使用原默认路径
+        if data_dir is None:
+            data_dir = config.BASE_DIR / "egnn" / "raw"
+        if output_dir is None:
+            output_dir = config.BASE_DIR / "egnn" / "models"
+
+    # ... 其余代码保持不变
     
     set_seed(42)
     
@@ -442,6 +457,11 @@ def main(data_dir: Optional[Path] = None,
     print(f"\n[2/3] 创建模型...")
     model = EGNNModel(in_features=20, hidden_dim=hidden_dim, num_layers=num_layers)
     model = model.to(DEVICE)
+    try:
+        model = torch.compile(model)
+        print("  ✓ 模型已编译 (torch.compile)")
+    except:
+        print("  ⚠️ torch.compile 不可用，跳过")
     
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  模型参数: {n_params:,}")
@@ -451,27 +471,37 @@ def main(data_dir: Optional[Path] = None,
     criterion = nn.HuberLoss(delta=1.0)  # Huber损失对异常值更鲁棒
     
     # 训练循环
+    # 训练循环
     print(f"\n[3/3] 开始训练...")
     best_val_loss = float('inf')
     patience_counter = 0
-    history = {'train_loss': [], 'val_loss': []}
-    
+    history = {'train_loss': [], 'val_loss': [], 'lr': []}
+    base_lr = lr  # 保存初始基准学习率
+
     for epoch in range(num_epochs):
         # 训练
         train_loss = train_epoch(model, train_loader, optimizer, criterion)
-        
+
         # 验证
         val_loss = validate(model, val_loader, criterion)
-        
+
         history['train_loss'].append(train_loss)
         history['val_loss'].append(val_loss)
-        
-        print(f"Epoch {epoch+1}/{num_epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}")
-        
-        # 早停检查
+        current_lr = optimizer.param_groups[0]["lr"]
+        history['lr'].append(current_lr)
+
+        print(
+            f"Epoch {epoch + 1}/{num_epochs}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, lr={current_lr:.2e}")
+
+        # ---------------- 自定义学习率调度逻辑 ----------------
         if val_loss < best_val_loss:
+            # 验证集性能改善：更新最优，学习率恢复原始base_lr
             best_val_loss = val_loss
             patience_counter = 0
+            # 恢复为初始学习率
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = base_lr
+            print(f"  ✓ 新最优val_loss，学习率恢复初始值 {base_lr:.2e}")
             # 保存最佳模型
             torch.save({
                 'epoch': epoch,
@@ -481,20 +511,26 @@ def main(data_dir: Optional[Path] = None,
             }, output_dir / "best_model.pt")
             print(f"  ✓ 保存最佳模型 (val_loss={val_loss:.4f})")
         else:
+            # 验证集没有改善：学习率减半
             patience_counter += 1
+            new_lr = current_lr * C
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = new_lr
+            print(f"  ⚠️ val_loss未改善，学习率降低 → {new_lr:.2e}")
+
             if patience_counter >= patience:
                 print(f"\n早停触发！连续{patience}轮验证损失未提升")
                 break
-    
-    # 保存训练历史
+
+    # 保存训练历史（增加lr记录，方便绘图查看lr变化）
     with open(output_dir / "training_history.json", 'w') as f:
         json.dump(history, f, indent=2)
-    
-    print(f"\n" + "="*60)
+
+    print(f"\n" + "=" * 60)
     print("训练完成!")
     print(f"最佳验证损失: {best_val_loss:.4f}")
     print(f"模型保存至: {output_dir / 'best_model.pt'}")
-    print("="*60)
+    print("=" * 60)
 
 
 if __name__ == "__main__":
@@ -507,7 +543,7 @@ if __name__ == "__main__":
     default_batch_size = config.EGNN_CONFIG.get("batch_size", 8)
     default_lr = config.EGNN_CONFIG.get("learning_rate", 1e-3)
     default_patience = config.EGNN_CONFIG.get("patience", 10)
-    
+
     parser = argparse.ArgumentParser(description='EGNN训练')
     parser.add_argument('--data-dir', type=Path, default=None)
     parser.add_argument('--output-dir', type=Path, default=None)
@@ -517,9 +553,11 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', type=int, default=default_batch_size)
     parser.add_argument('--lr', type=float, default=default_lr)
     parser.add_argument('--patience', type=int, default=default_patience)
-    
+    # 新增下面一行
+    parser.add_argument('--target', type=str, default=None, help="靶点名称")
+
     args = parser.parse_args()
-    
+
     main(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
@@ -528,5 +566,6 @@ if __name__ == "__main__":
         num_epochs=args.num_epochs,
         batch_size=args.batch_size,
         lr=args.lr,
-        patience=args.patience
+        patience=args.patience,
+        target_name=args.target  # 传入target_name
     )
